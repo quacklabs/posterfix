@@ -212,6 +212,7 @@ fi
 
 # Configure HAProxy for TCP load balancing outgoing to relays (replace relay IPs)
 cat $CERT_DIR/fullchain.pem > /etc/haproxy/ca.crt
+cat $CERT_DIR/$DOMAIN.key > /etc/haproxy/ca.crt.key
 cat <<EOF > /etc/haproxy/haproxy.cfg
 global
     log /dev/log local0
@@ -243,7 +244,7 @@ EOF
 line_number=1
 # Loop through the relay_list file and add server lines dynamically
 while IFS= read -r ip; do
-    echo "    server mx${line_number} ${ip}:587 ssl crt /etc/ssl/default/fullchain.pem verify required check send-proxy" >> /etc/haproxy/haproxy.cfg
+    echo "    server mx${line_number} ${ip}:587 ssl ca-file /etc/ssl/default/ca.pem crt /etc/ssl/default/fullchain.pem verify required check send-proxy" >> /etc/haproxy/haproxy.cfg
     ((line_number++))  # Increment the line number counter
 done < "$relay_list"
 
@@ -253,8 +254,10 @@ cat <<EOF >> /etc/haproxy/haproxy.cfg
 # Stats page
 listen stats
     bind *:9000
+    mode http
     stats enable
-    stats uri /haproxy_stats
+    stats uri /stats
+    stats refresh 10s
     stats auth admin:$admin_password
 EOF
 
