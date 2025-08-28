@@ -11,9 +11,8 @@ import daemon
 from pid import PidFile
 
 from config import *
-from dkim_sign import DKIMSigner
-from tls_manager import TLSManager
 from queue_processor import EmailQueueProcessor, EmailValidator
+from tls_manager import TLSManager
 
 class RateLimitedSMTPHandler:
     def __init__(self):
@@ -22,6 +21,7 @@ class RateLimitedSMTPHandler:
         self.queue_key = 'email_queue'
         self.validator = EmailValidator()
         self.queue_processor = EmailQueueProcessor()
+        self.tls_manager = TLSManager()
 
     async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
         try:
@@ -55,13 +55,19 @@ class RateLimitedSMTPHandler:
             subject = msg.get('Subject', 'No Subject')
             content = self._extract_email_content(msg)
             
+            # Extract sender name from From header if available
+            sender_name = 'System Sender'
+            from_header = msg.get('From', '')
+            if ' <' in from_header and '>' in from_header:
+                sender_name = from_header.split(' <')[0].strip()
+            
             # Prepare email data for queue
             email_data = {
                 'recipients': envelope.rcpt_tos,
                 'subject': subject,
                 'content': content,
-                'content_type': 'HTML' if 'html' in content.lower() else 'Text',
-                'sender_name': 'System Sender',  # Could extract from From header
+                'content_type': 'HTML' if self._is_html_content(content) else 'Text',
+                'sender_name': sender_name,
                 'received_time': time.time(),
                 'client_ip': session.peer[0] if hasattr(session, 'peer') else 'unknown'
             }
@@ -91,6 +97,10 @@ class RateLimitedSMTPHandler:
         else:
             return msg.get_payload(decode=True).decode('utf-8', errors='ignore')
         return ""
+
+    def _is_html_content(self, content):
+        """Check if content is HTML"""
+        return '<html>' in content.lower() or '<body>' in content.lower()
 
 class EmailProcessor:
     def __init__(self):
@@ -193,14 +203,16 @@ class EmailDaemon:
 
     async def start_services(self):
         """Start both SMTP receiver and email processor"""
-        # Start SMTP receiver
+        # Start SMTP receiver with TLS support
         handler = RateLimitedSMTPHandler()
         self.smtp_controller = Controller(
             handler,
             hostname=LISTEN_HOST,
             port=LISTEN_PORT,
             decode_data=True,
-            enable_SMTPUTF8=True
+            enable_SMTPUTF8=True,
+            # TLS context for incoming connections (HAProxy termination)
+            tls_context=TLSManager().create_server_ssl_context() if LISTEN_PORT == 587 else None
         )
         self.smtp_controller.start()
         logging.info(f"SMTP server started on {LISTEN_HOST}:{LISTEN_PORT}")
