@@ -1,280 +1,209 @@
-#!/usr/bin/env python3
-import asyncio
-import logging
-import signal
+import smtplib
 import time
-import email
-from email import policy
-from aiosmtpd.controller import Controller
+import logging
 import redis
-import daemon
-from pid import PidFile
-
-from config import *
-from queue_processor import EmailQueueProcessor, EmailValidator
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
+from collections import deque, defaultdict
+import dkim
+import ssl
 from tls_manager import TLSManager
+from config import *
+import socket
+import threading
+import re
 
-class RateLimitedSMTPHandler:
+class RateLimiter:
+    def __init__(self, default_limit_per_hour=DEFAULT_RATE_LIMIT):
+        self.default_limit_per_hour = default_limit_per_hour
+        self.sent_times = defaultdict(deque)
+        self.limits = {}
+        self.lock = threading.Lock()
+
+    def set_limit(self, host, port, limit):
+        with self.lock:
+            self.limits[(host, port)] = limit
+
+    def reset(self):
+        with self.lock:
+            self.sent_times.clear()
+
+    def can_send(self, host, port):
+        with self.lock:
+            current_time = time.time()
+            key = (host, port)
+            limit = self.limits.get(key, self.default_limit_per_hour)
+            
+            # Clean up old entries
+            while self.sent_times[key] and current_time - self.sent_times[key][0] > 3600:
+                self.sent_times[key].popleft()
+            
+            current_count = len(self.sent_times[key])
+            return current_count < limit
+
+    def record_send(self, host, port):
+        with self.lock:
+            key = (host, port)
+            self.sent_times[key].append(time.time())
+
+    def time_until_next_slot(self, host, port):
+        with self.lock:
+            key = (host, port)
+            limit = self.limits.get(key, self.default_limit_per_hour)
+            current_count = len(self.sent_times[key])
+            
+            if current_count < limit:
+                return 0
+            
+            oldest_time = self.sent_times[key][0]
+            current_time = time.time()
+            wait_time = 3600 - (current_time - oldest_time)
+            return max(0, wait_time)
+
+class EmailValidator:
+    @staticmethod
+    def validate_email_format(email_address):
+        """Validate email format using RFC 5322 compliant regex"""
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(pattern, email_address) is not None
+
+    @staticmethod
+    def sanitize_email_address(email_address):
+        """Sanitize and normalize email address"""
+        name, addr = email_address.split('@') if '@' in email_address else ('', email_address)
+        return addr.lower() if addr else email_address
+
+    @staticmethod
+    def filter_spam(text):
+        """Filter spam words from email content"""
+        return not any(word in text.lower() for word in SPAM_WORDS)
+
+    @staticmethod
+    def is_banned_tld(domain):
+        """Check if domain has banned TLD"""
+        return any(domain.endswith(tld) for tld in BANNED_TLDS)
+
+    @staticmethod
+    def is_blocklisted_domain(domain):
+        """Check if domain is in blocklist"""
+        return domain in BLOCKLIST_DOMAINS
+
+class MX_Server:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = int(port)
+
+class EmailQueueProcessor:
     def __init__(self):
         self.redis_client = redis.Redis(**REDIS_CONFIG)
-        self.rate_limit_key = 'email_rate_limit'
         self.queue_key = 'email_queue'
+        self.rate_limiter = RateLimiter(default_limit_per_hour=RATE_LIMIT)
         self.validator = EmailValidator()
-        self.queue_processor = EmailQueueProcessor()
         self.tls_manager = TLSManager()
+        self._mx_cache = {}
 
-    async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
+    def get_mx_servers(self, domain):
+        """Get MX servers for domain with caching, filtered by allowed ports"""
+        if domain in self._mx_cache:
+            return self._mx_cache[domain]
+
         try:
-            # Validate recipient format
-            if not self.validator.validate_email_format(address):
-                return '550 Invalid email address format'
-            
-            # Only accept emails for our domain
-            if not address.lower().endswith('@' + LOCAL_DOMAIN.lower()):
-                return '550 Not relaying to external domains'
-            
-            # Check recipient limit
-            if len(envelope.rcpt_tos) >= MAX_RECIPIENTS_PER_EMAIL:
-                return '550 Too many recipients'
-            
-            envelope.rcpt_tos.append(address.lower())
-            return '250 OK'
-            
+            # Implement MX server lookup logic here
+            # This is a placeholder for MX lookup logic (using DNS resolver or external service)
+            # For now, assume we're getting valid MX servers from DNS or a list
+
+            mx_servers = []  # This should come from DNS or external source
+            valid_ports = [2525, 587, 465]
+
+            filtered_mx_servers = [MX_Server(mx.host, mx.port) for mx in mx_servers if mx.port in valid_ports]
+            self._mx_cache[domain] = filtered_mx_servers
+            return filtered_mx_servers
         except Exception as e:
-            logging.error(f"RCPT handling error: {e}")
-            return '451 Temporary error'
+            logging.error(f"Error fetching MX servers for {domain}: {e}")
+            return []
 
-    async def handle_DATA(self, server, session, envelope):
-        try:
-            # Validate email size
-            if len(envelope.content) > MAX_EMAIL_SIZE:
-                return '552 Message too large'
-            
-            # Parse email to extract subject and content
-            msg = email.message_from_bytes(envelope.content, policy=policy.default)
-            subject = msg.get('Subject', 'No Subject')
-            content = self._extract_email_content(msg)
-            
-            # Extract sender name from From header if available
-            sender_name = 'System Sender'
-            from_header = msg.get('From', '')
-            if ' <' in from_header and '>' in from_header:
-                sender_name = from_header.split(' <')[0].strip()
-            
-            # Prepare email data for queue
-            email_data = {
-                'recipients': envelope.rcpt_tos,
-                'subject': subject,
-                'content': content,
-                'content_type': 'HTML' if self._is_html_content(content) else 'Text',
-                'sender_name': sender_name,
-                'received_time': time.time(),
-                'client_ip': session.peer[0] if hasattr(session, 'peer') else 'unknown'
-            }
-            
-            # Add to Redis queue
-            queue_size = self.redis_client.llen(self.queue_key)
-            if queue_size < MAX_QUEUE_SIZE:
-                self.redis_client.rpush(self.queue_key, str(email_data))
-                logging.info(f"Email queued with subject: {subject}, recipients: {len(envelope.rcpt_tos)}")
-                return '250 Message accepted for delivery'
-            else:
-                logging.warning("Queue full, rejecting email")
-                return '452 Queue full, try again later'
-            
-        except Exception as e:
-            logging.error(f"DATA handling error: {e}")
-            return '451 Temporary processing error'
-
-    def _extract_email_content(self, msg):
-        """Extract content from email message"""
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() == 'text/plain':
-                    return part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                elif part.get_content_type() == 'text/html':
-                    return part.get_payload(decode=True).decode('utf-8', errors='ignore')
-        else:
-            return msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-        return ""
-
-    def _is_html_content(self, content):
-        """Check if content is HTML"""
-        return '<html>' in content.lower() or '<body>' in content.lower()
-
-class EmailProcessor:
-    def __init__(self):
-        self.redis_client = redis.Redis(**REDIS_CONFIG)
-        self.rate_limit_key = 'email_rate_limit'
-        self.queue_key = 'email_queue'
-        self.queue_processor = EmailQueueProcessor()
-        self.running = False
-        self.stats = {
-            'emails_sent': 0,
-            'emails_failed': 0,
-            'queue_size': 0
-        }
-
-    async def process_queue(self):
-        """Process emails from the queue"""
-        self.queue_processor.start()
+    def send_mail_batch(self, mx_server, batch, subject, content, content_type, sender_name):
+        """Send batch of emails with rate limiting and DKIM signing"""
+        successful = []
+        failed = []
         
-        while self.running:
-            try:
-                # Get next batch from queue
-                batch_size = 10
-                email_data_list = []
-                
-                for _ in range(batch_size):
-                    email_data_str = self.redis_client.lpop(self.queue_key)
-                    if email_data_str:
+        with self.smtp_lock:
+            for recipient in batch:
+                # Check rate limit
+                while not self.rate_limiter.can_send(mx_server.host, mx_server.port):
+                    wait_time = self.rate_limiter.time_until_next_slot(mx_server.host, mx_server.port)
+                    time.sleep(wait_time)
+
+                try:
+                    # Create connection
+                    if mx_server.port == 465:
+                        server = smtplib.SMTP_SSL(mx_server.host, mx_server.port, timeout=20)
+                    else:
+                        server = smtplib.SMTP(mx_server.host, mx_server.port, timeout=20)
                         try:
-                            email_data = eval(email_data_str.decode())
-                            email_data_list.append(email_data)
-                        except Exception as e:
-                            logging.error(f"Error parsing queued email: {e}")
-                
-                if email_data_list:
-                    for email_data in email_data_list:
-                        successful, failed = self.queue_processor.process_emails(
-                            email_data['recipients'],
-                            email_data['subject'],
-                            email_data['content'],
-                            email_data['content_type'],
-                            email_data.get('sender_name', 'System Sender')
-                        )
-                        
-                        self.stats['emails_sent'] += len(successful)
-                        self.stats['emails_failed'] += len(failed)
-                        
-                        logging.info(f"Processed batch: {len(successful)} successful, {len(failed)} failed")
-                
-                await asyncio.sleep(QUEUE_PROCESSING_INTERVAL)
-                
-            except Exception as e:
-                logging.error(f"Queue processing error: {e}")
-                await asyncio.sleep(60)
+                            server.starttls(context=ssl.create_default_context())
+                        except smtplib.SMTPNotSupportedError:
+                            pass
 
-    async def update_stats(self):
-        """Update statistics periodically"""
-        while self.running:
-            try:
-                self.stats['queue_size'] = self.redis_client.llen(self.queue_key)
-                await asyncio.sleep(STATS_UPDATE_INTERVAL)
-            except Exception as e:
-                logging.error(f"Stats update error: {e}")
-                await asyncio.sleep(60)
+                        # Get the server's hostname dynamically
+                        server_hostname = socket.gethostname()  # e.g., 'mx1.primary-domain.com'
+                        server.ehlo(server_hostname)
 
-    async def health_check(self):
-        """Periodic health check"""
-        while self.running:
-            try:
-                # Test Redis connection
-                self.redis_client.ping()
-                logging.debug("Health check passed")
-            except Exception as e:
-                logging.error(f"Health check failed: {e}")
-            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+                    # Prepare message
+                    msg = MIMEMultipart()
+                    msg['From'] = formataddr((sender_name, 'local@server235.phx.secureservers.net'))
+                    msg['To'] = recipient
+                    msg['Subject'] = subject
 
-    async def start(self):
-        """Start the email processor with all background tasks"""
+                    # Apply DKIM signing
+                    personalized_content = content  # No personalization required now
+                    msg.attach(MIMEText(personalized_content, 'html' if content_type == 'HTML' else 'plain', 'utf-8'))
+                    msg = self.tls_manager.sign_email(msg)  # DKIM signing
+
+                    # Send email
+                    server.sendmail(recipient, [recipient], msg.as_string())
+                    self.rate_limiter.record_send(mx_server.host, mx_server.port)
+                    server.quit()
+                    
+                    successful.append(recipient)
+                    
+                except Exception as e:
+                    failed.append(recipient)
+                finally:
+                    socket.socket = self._original_socket
+
+        return successful, failed
+
+    def process_emails(self, emails, subject, content, content_type, sender_name):
+        """Process list of emails through appropriate MX servers"""
+        valid_emails, grouped_emails = self.group_by_domain(emails)
+        successful = []
+        failed = []
+        
+        for domain, domain_emails in grouped_emails.items():
+            mx_servers = self.get_mx_servers(domain)
+            if not mx_servers:
+                failed.extend(domain_emails)
+                continue
+
+            # Try each MX server
+            for mx_server in mx_servers:
+                domain_successful, domain_failed = self.send_mail_batch(
+                    mx_server, domain_emails, subject, content, content_type, sender_name
+                )
+                successful.extend(domain_successful)
+                failed.extend(domain_failed)
+                
+                if domain_successful:
+                    break  # Move to next domain if successful
+
+        return successful, failed
+
+    def start(self):
+        """Start the queue processor"""
         self.running = True
-        logging.info("Email processor started")
-        
-        # Start background tasks
-        stats_task = asyncio.create_task(self.update_stats())
-        health_task = asyncio.create_task(self.health_check())
-        queue_task = asyncio.create_task(self.process_queue())
-        
-        # Wait for all tasks
-        await asyncio.gather(stats_task, health_task, queue_task)
 
     def stop(self):
-        """Stop the email processor"""
+        """Stop the queue processor"""
         self.running = False
-        self.queue_processor.stop()
-        logging.info("Email processor stopped")
-
-class EmailDaemon:
-    def __init__(self):
-        self.smtp_controller = None
-        self.email_processor = None
-        self.running = False
-
-    async def start_services(self):
-        """Start both SMTP receiver and email processor"""
-        # Start SMTP receiver with TLS support
-        handler = RateLimitedSMTPHandler()
-        self.smtp_controller = Controller(
-            handler,
-            hostname=LISTEN_HOST,
-            port=LISTEN_PORT,
-            decode_data=True,
-            enable_SMTPUTF8=True,
-            # TLS context for incoming connections (HAProxy termination)
-            tls_context=TLSManager().create_server_ssl_context() if LISTEN_PORT == 587 else None
-        )
-        self.smtp_controller.start()
-        logging.info(f"SMTP server started on {LISTEN_HOST}:{LISTEN_PORT}")
-
-        # Start email processor
-        self.email_processor = EmailProcessor()
-        await self.email_processor.start()
-
-    def stop_services(self):
-        """Stop all services"""
-        if self.smtp_controller:
-            self.smtp_controller.stop()
-        if self.email_processor:
-            self.email_processor.stop()
-        logging.info("All services stopped")
-
-    def run(self):
-        """Main daemon run method"""
-        logging.basicConfig(
-            level=LOG_LEVEL,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(LOG_FILE),
-                logging.StreamHandler()
-            ]
-        )
-
-        # Handle signals properly
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        def signal_handler():
-            logging.info("Received shutdown signal")
-            self.running = False
-            self.stop_services()
-            loop.stop()
-
-        for sig in [signal.SIGTERM, signal.SIGINT]:
-            loop.add_signal_handler(sig, signal_handler)
-
-        try:
-            self.running = True
-            loop.run_until_complete(self.start_services())
-            loop.run_forever()
-                
-        except Exception as e:
-            logging.error(f"Daemon error: {e}")
-        finally:
-            self.stop_services()
-            loop.close()
-
-def main():
-    daemon_instance = EmailDaemon()
-    
-    with daemon.DaemonContext(
-        pidfile=PidFile(PID_FILE),
-        signal_map={
-            signal.SIGTERM: lambda signum, frame: exit(0),
-            signal.SIGINT: lambda signum, frame: exit(0)
-        }
-    ):
-        daemon_instance.run()
-
-if __name__ == '__main__':
-    main()
