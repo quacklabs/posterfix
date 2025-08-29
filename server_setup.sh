@@ -1,9 +1,10 @@
 #!/bin/bash
 
 DOMAIN=""
-relay_list=""
-admin_password=""
+RELAY_LIST=""
+PASSWORD=""
 CERT_DIR="/etc/ssl/default"
+KEY_DIR="/etc/dkim"
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -13,11 +14,11 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --relay_list)
-      relay_list="$2"
+      RELAY_LIST="$2"
       shift 2
       ;;
-    --admin_password)
-      admin_password="$3"
+    --password)
+      PASSWORD="$3"
       shift 2
       ;;
     *)
@@ -50,16 +51,6 @@ if [[ ! -f "$relay_list" ]]; then
   exit 1
 fi
 
-
-dns_countdown() {
-  local seconds=$1
-  while [ $seconds -gt 0 ]; do
-    echo -ne "Waiting for DNS propagation... $seconds seconds remaining\r"
-    sleep 1
-    ((seconds--))
-  done
-  echo -e "\nTime's up! Proceeding with certificate installation."
-}
 # Update and install packages
 apt update -y
 apt upgrade -y
@@ -168,23 +159,11 @@ if [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.cer" ]; then
         --key-file $CERT_DIR/$DOMAIN.key \
         --fullchain-file $CERT_DIR/fullchain.pem \
         --reloadcmd "systemctl reload apache2 && systemctl restart dovecot && systemctl restart postfix"
-
-    # acme.sh --install-cert -d $WILDCARD \
-    #     --ca-file $CERT_DIR/ca.pem \
-    #     --cert-file $CERT_DIR/$WILDCARD.pem \
-    #     --key-file $CERT_DIR/$WILDCARD.key \
-    #     --fullchain-file $CERT_DIR/$WILDCARD-fullchain.pem \
-    #     --reloadcmd "systemctl reload apache2 && systemctl restart dovecot && systemctl restart postfix"
 else
     rm -rf /root/.acme.sh/$DOMAIN/*
     echo "Please add the following DNS TXT records for domain verification:"
 
-    /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --force --standalone
-
-    echo "You have 5 minutes to add the required TXT records for DNS-01 challenge."
-    /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --standalone --force | grep -Eo 'Domain: .*' | sed 's/Domain: /_/'
-
-    dns_countdown 300
+    /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --standalone --force 
 
 
     # Check if the certificate has been issued successfully
@@ -197,17 +176,26 @@ else
         --fullchain-file $CERT_DIR/fullchain.pem \
         --reloadcmd "systemctl reload apache2 && systemctl restart dovecot && systemctl restart postfix"
 
-      # acme.sh --install-cert -d $WILDCARD \
-      #   --cert-file $CERT_DIR/$WILDCARD.pem \
-      #   --key-file $CERT_DIR/$WILDCARD.key \
-      #   --fullchain-file $CERT_DIR/$WILDCARD-fullchain.pem \
-      #   --reloadcmd "systemctl reload apache2 && systemctl restart dovecot && systemctl restart postfix"
     else
       echo "Error: Certificate issuance failed. Please check your DNS records and try again."
       exit 1
     fi
 fi
 
+
+#Setup DKIM
+mkdir -p "$KEY_DIR"
+cd "$KEY_DIR" || exit
+
+openssl genpkey -algorithm RSA -out "relay.private" -pkeyopt rsa_keygen_bits:2048
+openssl rsa -in "relay.private" -pubout -out "relay.public"
+
+PUBLIC_KEY=$(cat "relay.public" | grep -v "-----" | tr -d '\n')
+TXT_RECORD="relay._domainkey.${DOMAIN} IN TXT (\"v=DKIM1; k=rsa; p=${PUBLIC_KEY}\")"
+echo "### Add the following DNS TXT record to your DNS configuration ###"
+echo "$TXT_RECORD"
+echo ""
+cd ~
 
 
 # Configure HAProxy for TCP load balancing outgoing to relays (replace relay IPs)
@@ -322,6 +310,19 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+
+#Setup keys for relay servers
+useradd -m -s /bin/bash "dkim-user"
+echo "dkim-user:RestrictedAccess" | chpasswd
+usermod -s /usr/sbin/nologin "dkim-user"
+
+cat $CERT_DIR/fullchain.pem > $KEY_DIR/fullchain.pem
+cat $CERT_DIR/ca.pem > $KEY_DIR/ca.pem
+cat $CERT_DIR/$DOMAIN.key > $KEY_DIR/ssl.key
+cat $CERT_DIR/$DOMAIN.pem > $KEY_DIR/ssl.pem
+
+chown -R dkim-user:dkim-user $KEY_DIR
+chmod 750 $KEY_DIR
 
 systemctl daemon-reload
 systemctl enable acme-renew.timer
