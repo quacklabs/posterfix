@@ -1,6 +1,22 @@
 #!/bin/bash
 
 # Setup Script for the Email Daemon
+KEYS_DIR="/etc/shared_keys"
+MASTER=""
+SCP_PASSWORD="RestrictedAccess"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --master)
+      MASTER="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option $1"
+      exit 1
+      ;;
+  esac
+done
 
 # Step 1: Update system and install dependencies
 echo "Updating system and installing dependencies..."
@@ -19,21 +35,9 @@ sudo systemctl start redis-server
 # Step 3: Configure DKIM
 echo "Setting up DKIM..."
 
-# Generate DKIM key pair (if not already done)
-mkdir -p /etc/ssl/dkim
-openssl genpkey -algorithm RSA -out /etc/ssl/dkim/private.key -pkeyopt rsa_keygen_bits:2048
-openssl rsa -pubout -in /etc/ssl/dkim/private.key -out /etc/ssl/dkim/public.key
+# Setting Up SSL and DKIM from master server
+scp "dkim-user@$MASTER:/etc/relays" "$KEYS_DIR"
 
-# Configure DKIM in your DNS (you will need to create a DKIM TXT record manually in your DNS provider)
-echo "Please add the following DKIM TXT record to your DNS provider:"
-echo "Name: selector._domainkey.yourdomain.com"
-echo "Value: v=DKIM1; k=rsa; p=$(cat /etc/ssl/dkim/public.key)"
-
-# Step 4: Setup SSL certificates
-echo "Setting up SSL certificates..."
-
-# Create self-signed SSL certificates (or use valid ones from a provider)
-openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 -keyout /etc/ssl/certs/daemon.key -out /etc/ssl/certs/daemon.crt
 
 # Step 5: Setup the systemd service for the daemon
 echo "Setting up systemd service..."

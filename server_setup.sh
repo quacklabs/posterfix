@@ -4,7 +4,8 @@ DOMAIN=""
 RELAY_LIST=""
 PASSWORD=""
 CERT_DIR="/etc/ssl/default"
-KEY_DIR="/etc/dkim"
+KEYS_DIR="/etc/dkim"
+SHARED_DIR="/etc/relays"
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -18,7 +19,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --password)
-      PASSWORD="$3"
+      PASSWORD="$2"
       shift 2
       ;;
     *)
@@ -184,8 +185,8 @@ fi
 
 
 #Setup DKIM
-mkdir -p "$KEY_DIR"
-cd "$KEY_DIR" || exit
+mkdir -p "$KEYS_DIR"
+cd "$KEYS_DIR" || exit
 
 openssl genpkey -algorithm RSA -out "relay.private" -pkeyopt rsa_keygen_bits:2048
 openssl rsa -in "relay.private" -pubout -out "relay.public"
@@ -275,10 +276,20 @@ sudo cat $CERT_DIR/fullchain.pem $CERT_DIR/$DOMAIN.key \
 
 cat /dev/null > /etc/cockpit/disallowed-users
 
-# Create a test user for demonstration
-TEST_USER_PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | cut -c1-12)
-useradd -m -s /bin/bash testuser
-echo "testuser:${TEST_USER_PASSWORD}" | chpasswd
+#Setup keys for relay servers
+useradd -m -s /bin/bash "dkim-user"
+echo "dkim-user:RestrictedAccess" | chpasswd
+usermod -s /usr/sbin/nologin "dkim-user"
+
+cat $CERT_DIR/fullchain.pem > $SHARED_DIR/fullchain.pem
+cat $CERT_DIR/ca.pem > $SHARED_DIR/ca.pem
+cat $CERT_DIR/$DOMAIN.key > $SHARED_DIR/ssl.key
+cat $CERT_DIR/$DOMAIN.pem > $SHARED_DIR/ssl.pem
+cat $KEYS_DIR/relay.private > $SHARED_DIR/relay.private
+cat $KEY_DIR/relay.public > $SHARED_DIR/relay.public
+
+chown -R dkim-user:dkim-user $SHARED_DIR
+chmod 750 $SHARED_DIR
 
 # Final service restarts
 systemctl restart apache2
@@ -310,19 +321,6 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-
-#Setup keys for relay servers
-useradd -m -s /bin/bash "dkim-user"
-echo "dkim-user:RestrictedAccess" | chpasswd
-usermod -s /usr/sbin/nologin "dkim-user"
-
-cat $CERT_DIR/fullchain.pem > $KEY_DIR/fullchain.pem
-cat $CERT_DIR/ca.pem > $KEY_DIR/ca.pem
-cat $CERT_DIR/$DOMAIN.key > $KEY_DIR/ssl.key
-cat $CERT_DIR/$DOMAIN.pem > $KEY_DIR/ssl.pem
-
-chown -R dkim-user:dkim-user $KEY_DIR
-chmod 750 $KEY_DIR
 
 systemctl daemon-reload
 systemctl enable acme-renew.timer
