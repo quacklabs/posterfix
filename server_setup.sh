@@ -279,7 +279,7 @@ cat /dev/null > /etc/cockpit/disallowed-users
 
 #Setup keys for relay servers
 useradd -m -s /bin/bash "dkim-user"
-echo "dkim-user:RestrictedAccess" | chpasswd
+echo "dkim-user:Exc@libur" | chpasswd
 usermod -s /usr/sbin/nologin "dkim-user"
 
 cat $CERT_DIR/fullchain.pem > $SHARED_DIR/fullchain.pem
@@ -365,6 +365,7 @@ echo "================================================================"
 echo "1. Configure DNS A records for:"
 echo "  - DOMAIN -> $SERVER_IP"
 echo "  - webmail.$DOMAIN -> $SERVER_IP"
+echo "  - DKIM -> $TXT_RECORD"
 echo "2. Certificate auto-renewal is set up via systemd timer"
 echo "3. Test SSL configuration:"
 echo "  openssl s_client -connect mail.$DOMAIN:443 -servername mail.$DOMAIN"
