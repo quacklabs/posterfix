@@ -50,6 +50,7 @@ scp "dkim-user@$MASTER:/etc/relays/ssl.pem" "$KEYS_DIR/ssl.pem"
 scp "dkim-user@$MASTER:/etc/relays/relay.private" "$KEYS_DIR/relay.private"
 scp "dkim-user@$MASTER:/etc/relays/relay.public" "$KEYS_DIR/relay.public"
 
+
 # Step 5: Setup the systemd service for the daemon
 echo "Setting up systemd service..."
 

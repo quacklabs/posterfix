@@ -37,7 +37,7 @@ fi
 
 # Check if DOMAIN and relay_list are provided
 if [[ -z "$PASSWORD" ]]; then
-  echo "Error: --admin_password is required"
+  echo "Error: --password is required"
   exit 1
 fi
 
@@ -236,7 +236,7 @@ line_number=1
 while IFS= read -r ip; do
     echo "    server mx${line_number} ${ip}:587 ssl ca-file /etc/ssl/default/ca.pem crt /etc/ssl/default/fullchain.pem verify required check send-proxy" >> /etc/haproxy/haproxy.cfg
     ((line_number++))  # Increment the line number counter
-done < "$relay_list"
+done < "$RELAY_LIST"
 
 # Adding stats page for monitoring
 cat <<EOF >> /etc/haproxy/haproxy.cfg
@@ -248,7 +248,7 @@ listen stats
     stats enable
     stats uri /stats
     stats refresh 10s
-    stats auth admin:$admin_password
+    stats auth admin:Password
 EOF
 
 systemctl restart haproxy
