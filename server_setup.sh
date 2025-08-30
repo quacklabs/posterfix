@@ -35,7 +35,6 @@ if [[ -z "$DOMAIN" ]]; then
   exit 1
 fi
 
-# Check if DOMAIN and relay_list are provided
 if [[ -z "$PASSWORD" ]]; then
   echo "Error: --password is required"
   exit 1
@@ -129,7 +128,6 @@ systemctl reload apache2
 mkdir -p /var/www/acme-challenge
 chown www-data:www-data /var/www/acme-challenge
 
-
 # Restart services
 systemctl enable ufw
 systemctl restart postfix
@@ -160,8 +158,7 @@ SERVER_IP=$(hostname -I | awk '{print $1}')
 echo "Installing acme.sh..."
 cd /root
 curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
-# source ~/.bashrc
-
+source ~/.bashrc
 
 WILDCARD="*.$DOMAIN"
 
@@ -195,10 +192,19 @@ else
     echo "Certificate not found. Attempting to issue a new certificate..."
     
     # Issue certificate with DNS-01 challenge
-    TXT_RECORD=$( /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --force | awk -F'"' '{print $2}' )
+    echo "Requesting DNS challenge..."
+    TXT_RECORD=$(/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --pre-hook "echo 'Starting certificate issuance'" --force 2>&1 | grep -oP 'TXT value: \K[^"]+' | head -1)
+    
+    if [ -z "$TXT_RECORD" ]; then
+        # Alternative method to extract TXT record
+        TXT_RECORD=$(/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --force 2>&1 | grep -o 'TXT value: "[^"]*"' | cut -d'"' -f2)
+    fi
     
     if [ -z "$TXT_RECORD" ]; then
         echo "Error: Failed to retrieve DNS record for validation."
+        echo "Trying alternative approach..."
+        # Use debug mode to see the full output
+        /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --debug
         exit 1
     fi
 
@@ -206,6 +212,7 @@ else
     print_dns_record_and_wait "$TXT_RECORD"
 
     # Attempt to issue certificate after waiting
+    echo "Continuing with certificate issuance after DNS propagation..."
     /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --manual --force
 
     # Check if the certificate has been issued successfully
@@ -219,11 +226,13 @@ else
             --reloadcmd "systemctl reload apache2 && systemctl restart dovecot && systemctl restart postfix"
     else
         echo "Error: Certificate issuance failed. Please check your DNS records and try again."
+        echo "You can try running the certificate issuance manually:"
+        echo "/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --manual --force"
         exit 1
     fi
 fi
 
-#Setup DKIM
+# Setup DKIM
 mkdir -p "$KEYS_DIR"
 cd "$KEYS_DIR" || exit
 
@@ -236,7 +245,6 @@ echo "### Add the following DNS TXT record to your DNS configuration ###"
 echo "$TXT_RECORD"
 echo ""
 cd ~
-
 
 # Configure HAProxy for TCP load balancing outgoing to relays (replace relay IPs)
 cat $CERT_DIR/fullchain.pem > /etc/haproxy/ca.crt
@@ -291,7 +299,6 @@ EOF
 
 systemctl restart haproxy
 
-
 # Configure Dovecot to use Let's Encrypt certificates
 cat <<EOF > /etc/dovecot/conf.d/10-ssl.conf
 ssl = yes
@@ -316,17 +323,18 @@ sudo cat $CERT_DIR/fullchain.pem $CERT_DIR/$DOMAIN.key \
 
 cat /dev/null > /etc/cockpit/disallowed-users
 
-#Setup keys for relay servers
+# Setup keys for relay servers
 useradd -m -s /bin/bash "dkim-user"
 echo "dkim-user:Exc@libur" | chpasswd
 usermod -s /usr/sbin/nologin "dkim-user"
 
+mkdir -p $SHARED_DIR
 cat $CERT_DIR/fullchain.pem > $SHARED_DIR/fullchain.pem
 cat $CERT_DIR/ca.pem > $SHARED_DIR/ca.pem
 cat $CERT_DIR/$DOMAIN.key > $SHARED_DIR/ssl.key
 cat $CERT_DIR/$DOMAIN.pem > $SHARED_DIR/ssl.pem
 cat $KEYS_DIR/relay.private > $SHARED_DIR/relay.private
-cat $KEY_DIR/relay.public > $SHARED_DIR/relay.public
+cat $KEYS_DIR/relay.public > $SHARED_DIR/relay.public
 
 chown -R dkim-user:dkim-user $SHARED_DIR
 chmod 750 $SHARED_DIR
@@ -402,7 +410,6 @@ echo "================================================================"
 # Save credentials to a secure file
 cat > /root/mail_server_credentials.txt <<EOF
 MySQL Root Password: $MYSQL_ROOT_PASSWORD
-Test User: testuser / $TEST_USER_PASSWORD
 Webmail URL: https://mail.$DOMAIN/
 Cockpit URL: https://$DOMAIN:9090/
 SSL Certificates: $CERT_DIR
