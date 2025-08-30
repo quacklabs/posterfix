@@ -89,8 +89,7 @@ postconf -e "home_mailbox = Maildir/"
 postconf -e "smtpd_sasl_auth_enable = yes"
 postconf -e "smtpd_sasl_type = dovecot"
 postconf -e "smtpd_sasl_path = private/auth"
-postconf -e "smtpd_recipient_restrictions = permit_sasl_authenticated, reject_unauth_destination
-"
+postconf -e "smtpd_recipient_restrictions = permit_sasl_authenticated, reject_unauth_destination"
 
 # Configure Dovecot for IMAP
 cat <<EOF > /etc/dovecot/conf.d/10-mail.conf
@@ -183,7 +182,7 @@ sudo systemctl stop nginx
 # Check if certificate already exists
 if [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.cer" ]; then
     echo "Attempting to renew the certificate..."
-    /root/.acme.sh/acme.sh --renew -d $DOMAIN -d $WILDCARD --dns dns_01 --force
+    /root/.acme.sh/acme.sh --renew -d $DOMAIN -d $WILDCARD --manual --force
 
     /root/.acme.sh/acme.sh --install-cert -d $DOMAIN \
         --ca-file $CERT_DIR/ca.pem \
@@ -196,7 +195,7 @@ else
     echo "Certificate not found. Attempting to issue a new certificate..."
     
     # Issue certificate with DNS-01 challenge
-    TXT_RECORD=$( /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --dns dns_01 --force | awk -F'"' '{print $2}' )
+    TXT_RECORD=$( /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --force | awk -F'"' '{print $2}' )
     
     if [ -z "$TXT_RECORD" ]; then
         echo "Error: Failed to retrieve DNS record for validation."
@@ -207,7 +206,7 @@ else
     print_dns_record_and_wait "$TXT_RECORD"
 
     # Attempt to issue certificate after waiting
-    /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --dns dns_01 --force
+    /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --manual --force
 
     # Check if the certificate has been issued successfully
     if [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.cer" ]; then
