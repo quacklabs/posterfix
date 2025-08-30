@@ -13,6 +13,7 @@ from config import *
 import socket
 import threading
 import re
+import dns.resolver
 
 class RateLimiter:
     def __init__(self, default_limit_per_hour=DEFAULT_RATE_LIMIT):
@@ -103,10 +104,48 @@ class EmailQueueProcessor:
         self.tls_manager = TLSManager()
         self._mx_cache = {}
 
+    def ping_mx_server(self, host, port):
+        """Ping the MX server on the given port to check if it's an SMTP server"""
+        hostname = socket.gethostname()
+        greeting = f'EHLO {hostname}\r\n'
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(10)  # Timeout after 10 seconds
+                s.connect((host, port))  # Try to connect to the host and port
+                s.sendall(greeting.encode('utf-8'))
+                response = s.recv(1024)  # Receive server response
+                if b'220' in response:  # Check for "220" SMTP greeting code
+                    return True
+                else:
+                    logging.error(f"Failed to communicate with SMTP server {host}:{port}")
+                    return False
+        except socket.error as e:
+            logging.error(f"Error connecting to {host}:{port} - {e}")
+            return False
+
     def get_mx_servers(self, domain):
         """Get MX servers for domain with caching, filtered by allowed ports"""
         if domain in self._mx_cache:
             return self._mx_cache[domain]
+        
+        try:
+            # Perform DNS lookup to get MX servers
+            answers = dns.resolver.resolve(domain, 'MX')
+            mx_servers = []
+            valid_ports = [2525, 587, 465]
+            
+            for rdata in answers:
+                host = rdata.exchange.to_text().rstrip('.')  # Get the MX host
+                # Ping each MX server on the valid SMTP ports
+                for port in valid_ports:
+                    if self.ping_mx_server(host, port):  # Only add to list if it responds as SMTP
+                        mx_servers.append(MX_Server(host, port))
+
+            self._mx_cache[domain] = mx_servers
+            return mx_servers
+        except Exception as e:
+            logging.error(f"Error fetching MX servers for {domain}: {e}")
+            return []
 
         try:
             # Implement MX server lookup logic here
@@ -152,7 +191,7 @@ class EmailQueueProcessor:
 
                     # Prepare message
                     msg = MIMEMultipart()
-                    msg['From'] = formataddr((sender_name, 'local@server235.phx.secureservers.net'))
+                    msg['From'] = formataddr((sender_name, f''))
                     msg['To'] = recipient
                     msg['Subject'] = subject
 
