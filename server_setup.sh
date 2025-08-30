@@ -84,8 +84,13 @@ postconf -e "myhostname = $DOMAIN"
 postconf -e "mydestination = $DOMAIN, localhost.$DOMAIN, localhost"
 postconf -e "inet_interfaces = all"
 postconf -e "relayhost = [127.0.0.1]:2525"
-postconf -e "mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128"
+postconf -e "mynetworks = 0.0.0.0/0 [::]/0"
 postconf -e "home_mailbox = Maildir/"
+postconf -e "smtpd_sasl_auth_enable = yes"
+postconf -e "smtpd_sasl_type = dovecot"
+postconf -e "smtpd_sasl_path = private/auth"
+postconf -e "smtpd_recipient_restrictions = permit_sasl_authenticated, reject_unauth_destination
+"
 
 systemctl restart postfix
 
