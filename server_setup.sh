@@ -73,10 +73,11 @@ apt install ufw postfix haproxy cockpit mysql-server mysql-client php php-cli ph
 # Enable and start Cockpit
 systemctl enable --now cockpit.socket
 
-# Set hostname
+# Set hostname and fix host resolution
 echo "mail.$DOMAIN" > /etc/hostname
-hostnamectl set-hostname mail
-echo "127.0.0.1 localhost $DOMAIN" > /etc/hosts
+hostnamectl set-hostname "mail.$DOMAIN"
+echo "127.0.0.1 localhost mail.$DOMAIN mail" > /etc/hosts
+echo "::1 localhost ip6-localhost ip6-loopback" >> /etc/hosts
 
 # Configure Postfix for incoming (local delivery) and relay outgoing to HAProxy
 postconf -e "myhostname = $DOMAIN"
@@ -108,7 +109,7 @@ DOVECOT_CONF="/etc/dovecot/dovecot.conf"
 grep -q "service auth" $DOVECOT_CONF
 if [ $? -ne 0 ]; then
     # Add Dovecot SASL configuration to dovecot.conf
-    echo -e "\n# Enable Dovecot SASL for Postfix\nservice auth {\n   unix_listener /var/spool/postfix/private/auth {\n       mode = 0600\n       user = postfix\n       group = postfix\n   }\n}" | sudo tee -a $DOVECOT_CONF
+    echo -e "\n# Enable Dovecot SASL for Postfix\nservice auth {\n   unix_listener /var/spool/postfix/private/auth {\n       mode = 0600\n       user = postfix\n       group = postfix\n   }\n}" | tee -a $DOVECOT_CONF
     echo "Dovecot SASL configuration added to $DOVECOT_CONF"
 else
     echo "Dovecot SASL configuration already exists in $DOVECOT_CONF"
@@ -163,9 +164,17 @@ source ~/.bashrc
 WILDCARD="*.$DOMAIN"
 
 print_dns_record_and_wait() {
+    echo "================================================================"
+    echo "DNS CONFIGURATION REQUIRED"
+    echo "================================================================"
     echo "Please add the following DNS TXT record for domain verification:"
-    echo "_acme-challenge.$DOMAIN  TXT   \"$1\""
+    echo "Domain: _acme-challenge.$DOMAIN"
+    echo "Type: TXT"
+    echo "Value: \"$1\""
+    echo "================================================================"
     echo "Waiting for 5 minutes to allow DNS propagation..."
+    echo "Press Ctrl+C to abort, or wait for the script to continue automatically"
+    echo "================================================================"
     sleep 300  # 5-minute countdown
 }
 
@@ -173,8 +182,8 @@ print_dns_record_and_wait() {
 echo "Requesting wildcard SSL certificate for $DOMAIN and $WILDCARD..."
 mkdir -p $CERT_DIR
 /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-sudo systemctl stop apache2
-sudo systemctl stop nginx
+systemctl stop apache2
+systemctl stop nginx
 
 # Check if certificate already exists
 if [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.cer" ]; then
@@ -191,20 +200,32 @@ else
     rm -rf /root/.acme.sh/$DOMAIN/*
     echo "Certificate not found. Attempting to issue a new certificate..."
     
-    # Issue certificate with DNS-01 challenge
+    # Create a temporary script to capture the TXT record
+    cat > /tmp/acme_issue.sh << EOF
+#!/bin/bash
+/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --debug 2>&1
+EOF
+    chmod +x /tmp/acme_issue.sh
+    
+    # Run acme.sh and capture output
     echo "Requesting DNS challenge..."
-    TXT_RECORD=$(/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --pre-hook "echo 'Starting certificate issuance'" --force 2>&1 | grep -oP 'TXT value: \K[^"]+' | head -1)
+    ACME_OUTPUT=$(/tmp/acme_issue.sh)
+    
+    # Extract TXT record from output
+    TXT_RECORD=$(echo "$ACME_OUTPUT" | grep -o 'TXT value: "[^"]*"' | cut -d'"' -f2)
     
     if [ -z "$TXT_RECORD" ]; then
-        # Alternative method to extract TXT record
-        TXT_RECORD=$(/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --force 2>&1 | grep -o 'TXT value: "[^"]*"' | cut -d'"' -f2)
+        # Alternative extraction method
+        TXT_RECORD=$(echo "$ACME_OUTPUT" | grep -o 'TXT value: [^,]*' | awk '{print $3}' | tr -d '"')
     fi
     
     if [ -z "$TXT_RECORD" ]; then
         echo "Error: Failed to retrieve DNS record for validation."
-        echo "Trying alternative approach..."
-        # Use debug mode to see the full output
-        /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --debug
+        echo "ACME output was:"
+        echo "$ACME_OUTPUT"
+        echo ""
+        echo "Please check the output above for the TXT value and add it manually to your DNS."
+        echo "Then run: /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --manual --force"
         exit 1
     fi
 
@@ -318,13 +339,13 @@ postconf -e "smtpd_tls_security_level = may"
 
 # Configure Cockpit to use Let's Encrypt certificates
 mkdir -p /etc/cockpit/ws-certs.d
-sudo cat $CERT_DIR/fullchain.pem $CERT_DIR/$DOMAIN.key \
-    | sudo tee /etc/cockpit/ws-certs.d/rafmail.cert
+cat $CERT_DIR/fullchain.pem $CERT_DIR/$DOMAIN.key \
+    | tee /etc/cockpit/ws-certs.d/rafmail.cert
 
 cat /dev/null > /etc/cockpit/disallowed-users
 
 # Setup keys for relay servers
-useradd -m -s /bin/bash "dkim-user"
+useradd -m -s /bin/bash "dkim-user" 2>/dev/null || true
 echo "dkim-user:Exc@libur" | chpasswd
 usermod -s /usr/sbin/nologin "dkim-user"
 
