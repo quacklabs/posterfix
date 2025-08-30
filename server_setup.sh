@@ -92,8 +92,6 @@ postconf -e "smtpd_sasl_path = private/auth"
 postconf -e "smtpd_recipient_restrictions = permit_sasl_authenticated, reject_unauth_destination
 "
 
-systemctl restart postfix
-
 # Configure Dovecot for IMAP
 cat <<EOF > /etc/dovecot/conf.d/10-mail.conf
 mail_location = maildir:~/Maildir
@@ -271,6 +269,7 @@ ssl_prefer_server_ciphers = yes
 EOF
 
 # Configure Postfix to use Let's Encrypt certificates
+postconf -e "smtpd_use_tls = yes"
 postconf -e "smtpd_tls_cert_file = $CERT_DIR/$DOMAIN.pem"
 postconf -e "smtpd_tls_key_file = $CERT_DIR/$DOMAIN.key"
 postconf -e "smtp_tls_CAfile = $CERT_DIR/fullchain.pem"
