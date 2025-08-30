@@ -34,14 +34,14 @@ MAX_EMAIL_SIZE = 1024 * 1024  # 1MB
 
 # DKIM configuration
 DKIM_SELECTOR = 'relay'
-DKIM_PRIVATE_KEY_PATH = '/etc/ssl/relay.private'
+DKIM_PRIVATE_KEY_PATH = '/etc/ssl/default/relay.private'
 DKIM_DOMAIN = 'rafmail.com'
 
 # TLS Configuration
 TLS_CIPHERS = 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256'
 TLS_MIN_VERSION = ssl.TLSVersion.TLSv1_2
-TLS_CERT_FILE = '/etc/ssl/fullchain.pem'
-TLS_KEY_FILE = '/etc/ssl/ssl.key'
+TLS_CERT_FILE = '/etc/ssl/default/fullchain.pem'
+TLS_KEY_FILE = '/etc/ssl/default/ssl.key'
 
 # DNS configuration
 DNS_SERVERS = ['8.8.8.8', '1.1.1.1']  # Google DNS, Cloudflare DNS

@@ -130,6 +130,7 @@ ufw allow 110
 ufw allow 995
 ufw allow 9000
 ufw allow 587
+ufw allow 3000
 ufw --force enable
 
 # Get server IP address
@@ -234,7 +235,7 @@ EOF
 line_number=1
 # Loop through the relay_list file and add server lines dynamically
 while IFS= read -r ip; do
-    echo "    server mx${line_number} ${ip}:587 ssl ca-file /etc/ssl/default/ca.pem crt /etc/ssl/default/fullchain.pem verify required check send-proxy" >> /etc/haproxy/haproxy.cfg
+    echo "    server mx${line_number} ${ip}:3000 ssl ca-file /etc/ssl/default/ca.pem crt /etc/ssl/default/fullchain.pem verify required check send-proxy" >> /etc/haproxy/haproxy.cfg
     ((line_number++))  # Increment the line number counter
 done < "$RELAY_LIST"
 

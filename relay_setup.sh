@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Setup Script for the Email Daemon
-KEYS_DIR="/etc/shared_keys"
+KEYS_DIR="/etc/ssl/default"
 MASTER=""
-SCP_PASSWORD="RestrictedAccess"
+SCP_PASSWORD="Exc@libur"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -43,6 +43,7 @@ fi
 ssh-copy-id -i ~/.ssh/id_rsa.pub dkim-user@$MASTER
 
 # Setting Up SSL and DKIM from master server
+mkdir -p $KEYS_DIR
 scp "dkim-user@$MASTER:/etc/relays/fullchain.pem" "$KEYS_DIR/fullchain.pem"
 scp "dkim-user@$MASTER:/etc/relays/ca.pem" "$KEYS_DIR/ca.pem"
 scp "dkim-user@$MASTER:/etc/relays/ssl.key" "$KEYS_DIR/ssl.key"
