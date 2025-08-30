@@ -35,9 +35,20 @@ sudo systemctl start redis-server
 # Step 3: Configure DKIM
 echo "Setting up DKIM..."
 
-# Setting Up SSL and DKIM from master server
-scp "dkim-user@$MASTER:/etc/relays" "$KEYS_DIR"
+if [ ! -f ~/.ssh/id_rsa ]; then
+  echo "Creating SSH keys on source server..."
+  ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa -N ""
+fi
 
+ssh-copy-id -i ~/.ssh/id_rsa.pub dkim-user@$MASTER
+
+# Setting Up SSL and DKIM from master server
+scp "dkim-user@$MASTER:/etc/relays/fullchain.pem" "$KEYS_DIR/fullchain.pem"
+scp "dkim-user@$MASTER:/etc/relays/ca.pem" "$KEYS_DIR/ca.pem"
+scp "dkim-user@$MASTER:/etc/relays/ssl.key" "$KEYS_DIR/ssl.key"
+scp "dkim-user@$MASTER:/etc/relays/ssl.pem" "$KEYS_DIR/ssl.pem"
+scp "dkim-user@$MASTER:/etc/relays/relay.private" "$KEYS_DIR/relay.private"
+scp "dkim-user@$MASTER:/etc/relays/relay.public" "$KEYS_DIR/relay.public"
 
 # Step 5: Setup the systemd service for the daemon
 echo "Setting up systemd service..."

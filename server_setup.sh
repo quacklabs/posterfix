@@ -36,19 +36,19 @@ if [[ -z "$DOMAIN" ]]; then
 fi
 
 # Check if DOMAIN and relay_list are provided
-if [[ -z "$admin_password" ]]; then
+if [[ -z "$PASSWORD" ]]; then
   echo "Error: --admin_password is required"
   exit 1
 fi
 
-if [[ -z "$relay_list" ]]; then
+if [[ -z "$RELAY_LIST" ]]; then
   echo "Error: --relay_list is required"
   exit 1
 fi
 
 # Check if the relay_list file exists
-if [[ ! -f "$relay_list" ]]; then
-  echo "Error: The file '$relay_list' does not exist."
+if [[ ! -f "$RELAY_LIST" ]]; then
+  echo "Error: The file '$RELAY_LIST' does not exist."
   exit 1
 fi
 
@@ -123,12 +123,13 @@ ufw allow 22
 ufw allow 80
 ufw allow 443
 ufw allow 9090 
-ufw allow 25
+ufw block 25
 ufw allow 143 
 ufw allow 993
 ufw allow 110
 ufw allow 995
 ufw allow 9000
+ufw allow 587
 ufw --force enable
 
 # Get server IP address
