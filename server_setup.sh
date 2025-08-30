@@ -103,10 +103,28 @@ auth_mechanisms = plain login
 !include auth-system.conf.ext
 EOF
 
+# Define the Dovecot configuration file
+DOVECOT_CONF="/etc/dovecot/dovecot.conf"
+
+# Check if the necessary lines exist in the dovecot.conf
+grep -q "service auth" $DOVECOT_CONF
+if [ $? -ne 0 ]; then
+    # Add Dovecot SASL configuration to dovecot.conf
+    echo -e "\n# Enable Dovecot SASL for Postfix\nservice auth {\n   unix_listener /var/spool/postfix/private/auth {\n       mode = 0600\n       user = postfix\n       group = postfix\n   }\n}" | sudo tee -a $DOVECOT_CONF
+    echo "Dovecot SASL configuration added to $DOVECOT_CONF"
+else
+    echo "Dovecot SASL configuration already exists in $DOVECOT_CONF"
+fi
+
 # Enable Roundcube site and disable default site
 a2dissite 000-default.conf
 a2enmod ssl
 a2enmod rewrite
+
+a2ensite 000-default.conf
+a2ensite default-ssl.conf
+
+systemctl reload apache2
 
 # Create ACME challenge directory
 mkdir -p /var/www/acme-challenge
