@@ -165,6 +165,13 @@ curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
 
 
 WILDCARD="*.$DOMAIN"
+
+print_dns_record_and_wait() {
+    echo "Please add the following DNS TXT record for domain verification:"
+    echo "_acme-challenge.$DOMAIN  TXT   \"$1\""
+    echo "Waiting for 5 minutes to allow DNS propagation..."
+    sleep 300  # 5-minute countdown
+}
 # Issue Let's Encrypt certificate
 echo "Requesting wildcard SSL certificate for $DOMAIN and $WILDCARD..."
 mkdir -p $CERT_DIR
@@ -172,10 +179,10 @@ mkdir -p $CERT_DIR
 sudo systemctl stop apache2
 sudo systemctl stop nginx
 
-
+# Check if certificate already exists
 if [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.cer" ]; then
-    echo "Attempting to install the certificate..."
-    /root/.acme.sh/acme.sh --renew -d $DOMAIN -d $WILDCARD --standalone --force
+    echo "Attempting to renew the certificate..."
+    /root/.acme.sh/acme.sh --renew -d $DOMAIN -d $WILDCARD --dns dns_01 --force
 
     /root/.acme.sh/acme.sh --install-cert -d $DOMAIN \
         --ca-file $CERT_DIR/ca.pem \
@@ -185,27 +192,36 @@ if [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.cer" ]; then
         --reloadcmd "systemctl reload apache2 && systemctl restart dovecot && systemctl restart postfix"
 else
     rm -rf /root/.acme.sh/$DOMAIN/*
-    echo "Please add the following DNS TXT records for domain verification:"
+    echo "Certificate not found. Attempting to issue a new certificate..."
+    
+    # Issue certificate with DNS-01 challenge
+    TXT_RECORD=$( /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --dns dns_01 --force | grep -oP "(?<=_acme-challenge\.$DOMAIN\s+TXT\s+)[^ ]+" )
+    
+    if [ -z "$TXT_RECORD" ]; then
+        echo "Error: Failed to retrieve DNS record for validation."
+        exit 1
+    fi
 
-    /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --standalone --force 
+    # Print DNS TXT record and wait for 5 minutes to allow DNS propagation
+    print_dns_record_and_wait "$TXT_RECORD"
 
+    # Attempt to issue certificate after waiting
+    /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --dns dns_01 --force
 
     # Check if the certificate has been issued successfully
     if [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.cer" ]; then
-      echo "Certificate issued successfully! Installing the certificate..."
-      /root/.acme.sh/acme.sh --install-cert -d $DOMAIN \
-        --ca-file $CERT_DIR/ca.pem \
-        --cert-file $CERT_DIR/$DOMAIN.pem \
-        --key-file $CERT_DIR/$DOMAIN.key \
-        --fullchain-file $CERT_DIR/fullchain.pem \
-        --reloadcmd "systemctl reload apache2 && systemctl restart dovecot && systemctl restart postfix"
-
+        echo "Certificate issued successfully! Installing the certificate..."
+        /root/.acme.sh/acme.sh --install-cert -d $DOMAIN \
+            --ca-file $CERT_DIR/ca.pem \
+            --cert-file $CERT_DIR/$DOMAIN.pem \
+            --key-file $CERT_DIR/$DOMAIN.key \
+            --fullchain-file $CERT_DIR/fullchain.pem \
+            --reloadcmd "systemctl reload apache2 && systemctl restart dovecot && systemctl restart postfix"
     else
-      echo "Error: Certificate issuance failed. Please check your DNS records and try again."
-      exit 1
+        echo "Error: Certificate issuance failed. Please check your DNS records and try again."
+        exit 1
     fi
 fi
-
 
 #Setup DKIM
 mkdir -p "$KEYS_DIR"
