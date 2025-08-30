@@ -144,7 +144,7 @@ ufw allow 22
 ufw allow 80
 ufw allow 443
 ufw allow 9090 
-ufw block 25
+ufw reject 25
 ufw allow 143 
 ufw allow 993
 ufw allow 110
@@ -172,6 +172,7 @@ print_dns_record_and_wait() {
     echo "Waiting for 5 minutes to allow DNS propagation..."
     sleep 300  # 5-minute countdown
 }
+
 # Issue Let's Encrypt certificate
 echo "Requesting wildcard SSL certificate for $DOMAIN and $WILDCARD..."
 mkdir -p $CERT_DIR
@@ -195,7 +196,7 @@ else
     echo "Certificate not found. Attempting to issue a new certificate..."
     
     # Issue certificate with DNS-01 challenge
-    TXT_RECORD=$( /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --dns dns_01 --force | grep -oP "(?<=_acme-challenge\.$DOMAIN\s+TXT\s+)[^ ]+" )
+    TXT_RECORD=$( /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --dns dns_01 --force | awk -F'"' '{print $2}' )
     
     if [ -z "$TXT_RECORD" ]; then
         echo "Error: Failed to retrieve DNS record for validation."
