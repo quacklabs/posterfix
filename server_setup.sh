@@ -188,7 +188,7 @@ systemctl stop nginx
 # Check if certificate already exists
 if [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.cer" ]; then
     echo "Attempting to renew the certificate..."
-    /root/.acme.sh/acme.sh --renew -d $DOMAIN -d $WILDCARD --manual --force
+    /root/.acme.sh/acme.sh --renew -d $DOMAIN -d $WILDCARD --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please
 
     /root/.acme.sh/acme.sh --install-cert -d $DOMAIN \
         --ca-file $CERT_DIR/ca.pem \
@@ -203,7 +203,7 @@ else
     # Create a temporary script to capture the TXT record
     cat > /tmp/acme_issue.sh << EOF
 #!/bin/bash
-/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --manual --debug 2>&1
+/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --keylength 2048 --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please 2>&1
 EOF
     chmod +x /tmp/acme_issue.sh
     
@@ -220,12 +220,17 @@ EOF
     fi
     
     if [ -z "$TXT_RECORD" ]; then
+        # Try another pattern
+        TXT_RECORD=$(echo "$ACME_OUTPUT" | grep -A1 'Please add the following TXT record:' | tail -1 | sed 's/^[ \t]*//;s/[ \t]*$//')
+    fi
+    
+    if [ -z "$TXT_RECORD" ]; then
         echo "Error: Failed to retrieve DNS record for validation."
         echo "ACME output was:"
         echo "$ACME_OUTPUT"
         echo ""
         echo "Please check the output above for the TXT value and add it manually to your DNS."
-        echo "Then run: /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --manual --force"
+        echo "Then run: /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please"
         exit 1
     fi
 
@@ -234,7 +239,7 @@ EOF
 
     # Attempt to issue certificate after waiting
     echo "Continuing with certificate issuance after DNS propagation..."
-    /root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --manual --force
+    /root/.acme.sh/acme.sh --renew -d $DOMAIN -d $WILDCARD --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please
 
     # Check if the certificate has been issued successfully
     if [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.cer" ]; then
@@ -248,7 +253,7 @@ EOF
     else
         echo "Error: Certificate issuance failed. Please check your DNS records and try again."
         echo "You can try running the certificate issuance manually:"
-        echo "/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --manual --force"
+        echo "/root/.acme.sh/acme.sh --issue -d $DOMAIN -d $WILDCARD --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please"
         exit 1
     fi
 fi
@@ -326,7 +331,7 @@ ssl = yes
 ssl_cert = <$CERT_DIR/fullchain.pem
 ssl_key = <$CERT_DIR/$DOMAIN.key
 ssl_min_protocol = TLSv1.2
-ssl_cipher_list = ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384
+ssl_cipher_list = ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SSHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384
 ssl_prefer_server_ciphers = yes
 EOF
 
