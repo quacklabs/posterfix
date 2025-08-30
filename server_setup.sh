@@ -311,6 +311,9 @@ while IFS= read -r ip; do
 done < "$RELAY_LIST"
 
 # Adding stats page for monitoring
+cat $CERT_DIR/fullchain.pem > /etc/haproxy/ca.crt
+cat $CERT_DIR/$DOMAIN.key > /etc/haproxy/ca.crt.key
+
 cat <<EOF >> /etc/haproxy/haproxy.cfg
 
 # Stats page
