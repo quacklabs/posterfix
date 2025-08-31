@@ -708,21 +708,24 @@ class EmailQueueProcessor:
         # Hardcoded submission servers for some domains
         if domain == "gmail.com":
             mx_servers.append(MX_Server("smtp.gmail.com", 587))
+            mx_servers.append(MX_Server("smtp.gmail.com", 465))
             self._mx_cache[domain] = mx_servers
             return mx_servers
         elif domain in ["outlook.com", "live.com", "hotmail.com"]:
             mx_servers.append(MX_Server("smtp.office365.com", 587))
+            mx_servers.append(MX_Server("smtp.office365.com", 465))
             self._mx_cache[domain] = mx_servers
             return mx_servers
         elif domain == "yahoo.com":
             mx_servers.append(MX_Server("smtp.mail.yahoo.com", 587))
+            mx_servers.append(MX_Server("smtp.mail.yahoo.com", 465))
             self._mx_cache[domain] = mx_servers
             return mx_servers
 
         # Fallback: DNS MX lookup
         try:
             answers = dns.resolver.resolve(domain, 'MX')
-            valid_ports = [2525, 587, 465]
+            valid_ports = [2525, 587, 465, 25]
 
             for rdata in answers:
                 host = rdata.exchange.to_text().rstrip('.')
