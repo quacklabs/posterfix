@@ -34,7 +34,7 @@ if [[ -z "$MASTER" ]]; then
 fi
 
 
-echo "mail.$DOMAIN" > /etc/hostname
+echo "$SERIAL.$DOMAIN" > /etc/hostname
 hostnamectl set-hostname "$SERIAL.$DOMAIN"
 echo "127.0.0.1 localhost $SERIAL.$DOMAIN $SERIAL" > /etc/hosts
 echo "::1 localhost ip6-localhost ip6-loopback" >> /etc/hosts
@@ -46,7 +46,7 @@ sudo apt-get update -y
 sudo apt-get upgrade -y
 
 # Install Python and pip if not already installed
-sudo apt-get install -y python3 python3-pip python3-venv python3-full
+sudo apt-get install -y python3 python3-pip python3-venv python3-full ufw
 
 # Create project directory
 echo "Creating project directory..."
@@ -276,6 +276,10 @@ except Exception as e:
     traceback.print_exc()
 "
 fi
+
+#Setup firewall
+ufw enable
+ufw allow from $MASTER to any port 3000
 
 echo "Setup complete!"
 echo "Virtual environment location: $VENV_DIR"
