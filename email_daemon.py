@@ -698,15 +698,32 @@ class EmailQueueProcessor:
             logger.error(f"Error connecting to {host}:{port} - {e}")
             return False
 
+
     def get_mx_servers(self, domain):
         if domain in self._mx_cache:
             return self._mx_cache[domain]
-        
+
+        mx_servers = []
+
+        # Hardcoded submission servers for some domains
+        if domain == "gmail.com":
+            mx_servers.append(MX_Server("smtp.gmail.com", 587))
+            self._mx_cache[domain] = mx_servers
+            return mx_servers
+        elif domain in ["outlook.com", "live.com", "hotmail.com"]:
+            mx_servers.append(MX_Server("smtp.office365.com", 587))
+            self._mx_cache[domain] = mx_servers
+            return mx_servers
+        elif domain == "yahoo.com":
+            mx_servers.append(MX_Server("smtp.mail.yahoo.com", 587))
+            self._mx_cache[domain] = mx_servers
+            return mx_servers
+
+        # Fallback: DNS MX lookup
         try:
             answers = dns.resolver.resolve(domain, 'MX')
-            mx_servers = []
             valid_ports = [2525, 587, 465]
-            
+
             for rdata in answers:
                 host = rdata.exchange.to_text().rstrip('.')
                 for port in valid_ports:
@@ -718,6 +735,8 @@ class EmailQueueProcessor:
         except Exception as e:
             logger.error(f"Error fetching MX servers for {domain}: {e}")
             return []
+
+
 
     def group_by_domain(self, emails):
         valid_emails = []
