@@ -267,35 +267,38 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         self.send_response('221 2.0.0 Bye')
         self.connected = False
 
+
     def smtp_MAIL(self, arg):
         if not arg or not arg.upper().startswith("FROM:"):
             self.send_response("501 5.5.4 Syntax: MAIL FROM:<address>")
             return
 
-        # remove leading FROM:
-        addr = arg[5:].strip()
+        raw = arg[5:].strip()
 
-        # split off any ESMTP parameters (e.g. SIZE=)
-        if " " in addr:
-            addr = addr.split(" ", 1)[0]
+        # drop any extra parameters (ESMTP extensions like SIZE=, BODY=, etc.)
+        parts = raw.split()
+        addr = parts[0] if parts else ""
 
-        # handle null sender <>
+        # handle null sender
         if addr in ("", "<>"):
             self.mailfrom = ""
             self.send_response("250 2.1.0 OK")
             return
 
-        # strip angle brackets and quotes
+        # strip <> and quotes
         if addr.startswith("<") and addr.endswith(">"):
             addr = addr[1:-1]
         addr = addr.strip().strip('"')
 
+        # validate bare address
         if not EmailValidator.validate_email_format(addr):
             self.send_response("553 5.1.7 Invalid sender address")
             return
 
         self.mailfrom = addr
         self.send_response("250 2.1.0 OK")
+
+
 
     def smtp_RCPT(self, arg):
         # Accept RCPT parameters (e.g. NOTIFY, ORCPT, etc.) by trimming after first space
