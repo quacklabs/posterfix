@@ -657,45 +657,81 @@ class EmailQueueProcessor:
     def process_queue(self):
         while self.running:
             try:
+                # First try to get from local queue (non-blocking)
                 try:
                     email_data = self.local_queue.get_nowait()
+                    self.process_single_email(email_data)
                 except queue.Empty:
+                    # If local queue is empty, check Redis with blocking pop
                     email_data_json = self.redis_client.blpop(self.queue_key, timeout=1)
-                    if not email_data_json:
-                        time.sleep(1)
-                        continue
-                    email_data = json.loads(email_data_json[1])
-                
-                recipients = email_data['recipients']
-                subject = email_data['subject']
-                content = email_data['content']
-                content_type = email_data['content_type']
-                sender_name = email_data['sender_name']
-                
-                successful, failed = self.process_emails(recipients, subject, content, content_type, sender_name)
-                
-                logger.info(f"Processed email: {len(successful)} successful, {len(failed)} failed")
-                
+                    if email_data_json:
+                        email_data = json.loads(email_data_json[1])
+                        self.process_single_email(email_data)
+                    else:
+                        time.sleep(0.1)  # Short sleep to prevent CPU spinning
+                        
             except Exception as e:
                 logger.error(f"Error processing queue: {e}")
                 time.sleep(5)
 
+    def process_single_email(self, email_data):
+        """Process a single email from the queue"""
+        recipients = email_data['recipients']
+        subject = email_data['subject']
+        content = email_data['content']
+        content_type = email_data['content_type']
+        sender_name = email_data['sender_name']
+        
+        successful, failed = self.process_emails(recipients, subject, content, content_type, sender_name)
+        
+        logger.info(f"Processed email: {len(successful)} successful, {len(failed)} failed")
+
     def ping_mx_server(self, host, port):
-        hostname = socket.gethostname()
-        greeting = f'EHLO {hostname}\r\n'
+        """
+        Test if an SMTP server is reachable and responsive on a given port.
+        Handles both plain SMTP and SSL/TLS connections appropriately.
+        """
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(10)
-                s.connect((host, port))
-                s.sendall(greeting.encode('utf-8'))
-                response = s.recv(1024)
-                if b'220' in response:
-                    return True
-                else:
-                    logger.error(f"Failed to communicate with SMTP server {host}:{port}")
-                    return False
-        except socket.error as e:
-            logger.error(f"Error connecting to {host}:{port} - {e}")
+            # Handle SSL ports (465) differently
+            if port == 465:
+                context = ssl.create_default_context()
+                with socket.create_connection((host, port), timeout=10) as sock:
+                    with context.wrap_socket(sock, server_hostname=host) as ssock:
+                        return self._check_smtp_response(ssock, host, port)
+            else:
+                # For non-SSL ports (25, 587, 2525)
+                with socket.create_connection((host, port), timeout=10) as sock:
+                    return self._check_smtp_response(sock, host, port)
+                    
+        except (socket.error, ssl.SSLError, OSError) as e:
+            logger.debug(f"Connection failed to {host}:{port} - {e}")
+            return False
+
+    def _check_smtp_response(self, sock, host, port):
+        """Helper method to check SMTP server response"""
+        try:
+            # Read the initial banner (should start with 220)
+            banner = sock.recv(1024).decode('utf-8', errors='ignore')
+            if not banner.startswith('220'):
+                logger.debug(f"Invalid banner from {host}:{port}: {banner.strip()}")
+                return False
+            
+            # Send EHLO
+            hostname = socket.gethostname()
+            ehlo_command = f'EHLO {hostname}\r\n'
+            sock.sendall(ehlo_command.encode('utf-8'))
+            
+            # Read EHLO response (should start with 250)
+            response = sock.recv(1024).decode('utf-8', errors='ignore')
+            if response.startswith('250'):
+                logger.debug(f"Successfully connected to {host}:{port}")
+                return True
+            else:
+                logger.debug(f"EHLO failed for {host}:{port}: {response.strip()}")
+                return False
+                
+        except (socket.error, OSError, UnicodeDecodeError) as e:
+            logger.debug(f"Communication error with {host}:{port} - {e}")
             return False
 
 
@@ -705,24 +741,7 @@ class EmailQueueProcessor:
 
         mx_servers = []
 
-        # Hardcoded submission servers for some domains
-        if domain == "gmail.com":
-            mx_servers.append(MX_Server("smtp.gmail.com", 587))
-            mx_servers.append(MX_Server("smtp.gmail.com", 465))
-            self._mx_cache[domain] = mx_servers
-            return mx_servers
-        elif domain in ["outlook.com", "live.com", "hotmail.com"]:
-            mx_servers.append(MX_Server("smtp.office365.com", 587))
-            mx_servers.append(MX_Server("smtp.office365.com", 465))
-            self._mx_cache[domain] = mx_servers
-            return mx_servers
-        elif domain == "yahoo.com":
-            mx_servers.append(MX_Server("smtp.mail.yahoo.com", 587))
-            mx_servers.append(MX_Server("smtp.mail.yahoo.com", 465))
-            self._mx_cache[domain] = mx_servers
-            return mx_servers
-
-        # Fallback: DNS MX lookup
+        # DNS MX lookup only
         try:
             answers = dns.resolver.resolve(domain, 'MX')
             valid_ports = [2525, 587, 465, 25]
@@ -732,37 +751,41 @@ class EmailQueueProcessor:
                 for port in valid_ports:
                     if self.ping_mx_server(host, port):
                         mx_servers.append(MX_Server(host, port))
+                        # Return first available server immediately
+                        self._mx_cache[domain] = mx_servers
+                        return mx_servers
 
+            # If no servers found through MX lookup
             self._mx_cache[domain] = mx_servers
             return mx_servers
+            
         except Exception as e:
             logger.error(f"Error fetching MX servers for {domain}: {e}")
             return []
 
 
+        def group_by_domain(self, emails):
+            valid_emails = []
+            grouped_emails = defaultdict(list)
+            
+            for email_addr in emails:
+                if not self.validator.validate_email_format(email_addr):
+                    logger.warning(f"Invalid email format: {email_addr}")
+                    continue
+                    
+                domain = email_addr.split('@')[1]
+                
+                if (self.validator.is_banned_tld(domain) or 
+                    self.validator.is_blocklisted_domain(domain)):
+                    logger.warning(f"Email domain blocked: {domain}")
+                    continue
+                    
+                valid_emails.append(email_addr)
+                grouped_emails[domain].append(email_addr)
+                
+            return valid_emails, grouped_emails
 
-    def group_by_domain(self, emails):
-        valid_emails = []
-        grouped_emails = defaultdict(list)
         
-        for email_addr in emails:
-            if not self.validator.validate_email_format(email_addr):
-                logger.warning(f"Invalid email format: {email_addr}")
-                continue
-                
-            domain = email_addr.split('@')[1]
-            
-            if (self.validator.is_banned_tld(domain) or 
-                self.validator.is_blocklisted_domain(domain)):
-                logger.warning(f"Email domain blocked: {domain}")
-                continue
-                
-            valid_emails.append(email_addr)
-            grouped_emails[domain].append(email_addr)
-            
-        return valid_emails, grouped_emails
-
-    
     def send_mail_batch(self, mx_server, batch, subject, content, content_type, sender_name):
         successful = []
         failed = []
