@@ -36,8 +36,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger('EmailDaemon')
 
-# SSL-enabled TCP server
-class SSLThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
+
+
+class DualModeTCPServer(ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
     timeout = 10
@@ -51,25 +52,40 @@ class SSLThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
         socket, addr = super().get_request()
         socket.settimeout(10)
         
-        if self.ssl_context:
-            try:
-                # Wrap socket with SSL immediately (HAProxy expects this)
-                socket = self.ssl_context.wrap_socket(socket, server_side=True)
-                logger.info(f"SSL handshake completed with {addr}")
-            except ssl.SSLError as e:
-                logger.warning(f"SSL handshake failed with {addr}: {e}")
-                try:
-                    # Still try to send SMTP response
-                    socket.sendall(b'220 ESMTP Email Daemon ready\r\n')
-                except:
-                    pass
-                socket.close()
-                raise
-            except Exception as e:
-                logger.error(f"Error wrapping socket with SSL: {e}")
-                socket.close()
-                raise
+        # Check if this is an SSL connection by peeking at the first few bytes
+        try:
+            # Peek at the first few bytes to detect SSL handshake
+            peek_data = socket.recv(5, socket.MSG_PEEK)
+            if len(peek_data) >= 5 and self.is_ssl_handshake(peek_data):
+                logger.info(f"Detected SSL connection from {addr}")
+                if self.ssl_context:
+                    try:
+                        socket = self.ssl_context.wrap_socket(socket, server_side=True)
+                        logger.info(f"SSL handshake completed with {addr}")
+                    except ssl.SSLError as e:
+                        logger.warning(f"SSL handshake failed with {addr}: {e}")
+                        # Fall back to plain TCP
+                        logger.info(f"Falling back to plain TCP for {addr}")
+                else:
+                    logger.warning(f"SSL connection detected but no SSL context available for {addr}")
+            else:
+                logger.info(f"Plain TCP connection from {addr}")
+                
+        except Exception as e:
+            logger.error(f"Error detecting connection type from {addr}: {e}")
+            # Continue with plain TCP
+        
         return socket, addr
+    
+    def is_ssl_handshake(self, data):
+        """Detect SSL/TLS handshake by checking the first byte"""
+        if len(data) < 1:
+            return False
+        
+        # SSL/TLS handshake starts with 0x16 (Content Type: Handshake)
+        # TLS version starts with 0x03 (SSL3.0/TLS1.0+)
+        return data[0] == 0x16 and len(data) >= 5 and data[1:3] == b'\x03\x01'
+
 
 class SMTPRequestHandler(socketserver.BaseRequestHandler):
     def __init__(self, request, client_address, server):
@@ -87,7 +103,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         try:
             logger.info(f"New connection from {self.client_ip}:{self.client_port}")
             
-            # Send immediate SMTP greeting - HAProxy expects this immediately
+            # Send immediate SMTP greeting
             greeting = '220 %s ESMTP Email Daemon ready\r\n' % socket.getfqdn()
             self.request.sendall(greeting.encode())
             logger.debug("SMTP 220 greeting sent")
@@ -96,6 +112,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             logger.error(f"Error in setup: {e}")
             self.connected = False
 
+    
     def handle(self):
         logger.info(f"Handling connection from {self.client_ip}:{self.client_port}")
         
@@ -140,6 +157,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
                 logger.error(f"Error handling request: {e}")
                 break
 
+
     def process_smtp_command(self, line):
         """Process SMTP commands with HAProxy health check support"""
         # Check if this is a HAProxy health check
@@ -170,6 +188,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         ]
         
         return any(health_check_patterns)
+
 
     def handle_haproxy_health_check(self, line):
         """Handle HAProxy health check commands"""
@@ -204,7 +223,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         else:
             self.send_response('250 OK')
             logger.info(f"Responded to unknown health check: {line}")
-
+    
     def process_smtp_command_state(self, line):
         """Process regular SMTP commands"""
         i = line.find(' ')
@@ -376,7 +395,7 @@ class HAProxySMTPServer:
         
         if use_ssl:
             self.setup_ssl_context()
-        
+
     def setup_ssl_context(self):
         """Setup SSL context for secure connections"""
         try:
@@ -395,11 +414,9 @@ class HAProxySMTPServer:
             
         except Exception as e:
             logger.error(f"Failed to setup SSL context: {e}")
-            # Fallback to basic context
-            self.ssl_context = ssl.create_default_context()
-            self.ssl_context.check_hostname = False
-            self.ssl_context.verify_mode = ssl.CERT_NONE
-        
+            self.ssl_context = None
+
+
     def start(self):
         class HandlerFactory:
             def __init__(self, processor):
@@ -408,7 +425,7 @@ class HAProxySMTPServer:
             def __call__(self, *args):
                 return SMTPRequestHandler(*args)
         
-        class CustomServer(SSLThreadedTCPServer):
+        class CustomServer(DualModeTCPServer):
             def __init__(self, server_address, handler_class, processor, ssl_context=None):
                 super().__init__(server_address, handler_class, processor, ssl_context)
                 self.processor = processor
@@ -425,8 +442,7 @@ class HAProxySMTPServer:
             
             self.server.socket.settimeout(30)
             
-            ssl_status = "with SSL" if self.use_ssl else "without SSL"
-            logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port} {ssl_status}")
+            logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port} (Supports both SSL and Plain TCP)")
             
             # Test local connectivity
             test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
