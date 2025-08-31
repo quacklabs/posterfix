@@ -75,11 +75,15 @@ logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
 # ==================== UTILITIES ====================
+_EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+
 class EmailValidator:
     @staticmethod
     def validate_email_format(email_address: str) -> bool:
-        pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
-	    return re.match(pattern, email) is not None
+        if not email_address:
+            return False
+        s = str(email_address).strip()
+        return bool(_EMAIL_RE.fullmatch(s))
 
     @staticmethod
     def is_banned_tld(domain):
@@ -261,13 +265,26 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         if not arg or not arg.upper().startswith('FROM:'):
             self.send_response('501 5.5.4 Syntax: MAIL FROM:<address>')
             return
+
         addr = arg[5:].strip()
+        # drop any additional parameters (e.g. SIZE=...)
+        addr = addr.split()[0] if addr else addr
+
+        # handle null sender <>
+        if addr == '<>' or addr == '':
+            self.mailfrom = ''
+            self.send_response('250 2.1.0 OK')
+            return
+
+        # strip angle brackets and surrounding quotes/spaces
         if addr.startswith('<') and addr.endswith('>'):
             addr = addr[1:-1]
+        addr = addr.strip().strip('"')
+
         if not EmailValidator.validate_email_format(addr):
-            logger.error(f"address validation failed: {addr}")
             self.send_response('553 5.1.7 Invalid sender address')
             return
+
         self.mailfrom = addr
         self.send_response('250 2.1.0 OK')
 
