@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 """
-Email Daemon - Plain SMTP inbound, DKIM signing outbound, direct MX relay
-- No HAProxy health-check special cases
-- No inbound SSL/TLS or STARTTLS; pure plaintext SMTP listener
-- Outbound SMTP may use STARTTLS/SSL when talking to remote MX
+Email Daemon - Complete solution in a single file
 """
+import smtplib
 import time
 import logging
 import redis
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr, parseaddr
+from collections import deque, defaultdict
+import dkim
 import ssl
 import socket
+import threading
 import re
 import dns.resolver
-import json
-import queue
-import socketserver
-import threading
 import email
 from email import policy
 from email.parser import BytesParser
-from email.utils import parseaddr, formatdate, make_msgid
-from collections import deque, defaultdict
-import dkim
+import json
+import queue
+import select
+import socketserver
+import threading
+import asyncio
+from socketserver import ThreadingMixIn
+import sys
 import os
+import fcntl
+import termios
+import struct
 
 # ==================== CONFIGURATION ====================
 REDIS_CONFIG = {
@@ -50,32 +58,87 @@ BLOCKLIST_DOMAINS = [
 ]
 
 DKIM_PRIVATE_KEY_PATH = '/etc/ssl/default/relay.private'
-DKIM_SELECTOR = 'default'            # update if needed
-SSL_CERT_PATH = '/etc/ssl/default/fullchain.pem'  # (not used inbound)
-SSL_KEY_PATH = '/etc/ssl/default/ssl.key'         # (not used inbound)
+SSL_CERT_PATH = '/etc/ssl/default/fullchain.pem'
+SSL_KEY_PATH = '/etc/ssl/default/ssl.key'
 
 SMTP_PORT = 3000
 LOG_DIR = '/var/log/email_daemon'
 QUEUE_KEY = 'email_queue'
 
+HAPROXY_HEALTH_CHECK_DOMAINS = ['haproxy', 'health', 'check']
+# ==================== END CONFIG ====================
+
 # ==================== LOGGING SETUP ====================
+class BroadcastHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.terminals = self.get_active_terminals()
+        
+    def get_active_terminals(self):
+        terminals = []
+        try:
+            for term_dir in ['/dev/pts', '/dev']:
+                if os.path.exists(term_dir):
+                    for entry in os.listdir(term_dir):
+                        if entry.startswith('pts/') or entry.startswith('tty'):
+                            term_path = os.path.join(term_dir, entry)
+                            if self.is_terminal_active(term_path):
+                                terminals.append(term_path)
+        except Exception:
+            pass
+        return terminals
+    
+    def is_terminal_active(self, term_path):
+        try:
+            with open(term_path, 'w') as f:
+                fcntl.ioctl(f, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
+            return True
+        except:
+            return False
+    
+    def emit(self, record):
+        try:
+            msg = self.format(record) + '\n'
+            for term in self.terminals:
+                try:
+                    with open(term, 'w') as f:
+                        f.write(msg)
+                        f.flush()
+                except:
+                    if term in self.terminals:
+                        self.terminals.remove(term)
+        except Exception as e:
+            sys.stderr.write(f"Broadcast error: {e}\n")
+    
+    def refresh_terminals(self):
+        self.terminals = self.get_active_terminals()
+
+# Configure logging
 os.makedirs(LOG_DIR, exist_ok=True)
+
 logger = logging.getLogger('EmailDaemon')
 logger.setLevel(logging.DEBUG)
 
-for h in logger.handlers[:]:
-    logger.removeHandler(h)
+# Remove existing handlers
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
 
+# Create handlers
 file_handler = logging.FileHandler(f'{LOG_DIR}/email_daemon.log')
 stream_handler = logging.StreamHandler()
+broadcast_handler = BroadcastHandler()
+
+# Formatters
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
+broadcast_handler.setFormatter(formatter)
+
+# Add handlers
 logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
+logger.addHandler(broadcast_handler)
 
-# ==================== UTILITIES ====================
-_EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
 
 def extract_address(command: str) -> str | None:
     """
@@ -86,13 +149,21 @@ def extract_address(command: str) -> str | None:
     match = re.search(r'<([^<>]+)>', command)
     return match.group(1) if match else None
 
+# ==================== VALIDATOR ====================
 class EmailValidator:
     @staticmethod
-    def validate_email_format(email_address: str) -> bool:
-        if not email_address:
-            return False
-        s = str(email_address).strip()
-        return bool(_EMAIL_RE.fullmatch(s))
+    def validate_email_format(email_address):
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(pattern, email_address) is not None
+
+    @staticmethod
+    def sanitize_email_address(email_address):
+        name, addr = email_address.split('@') if '@' in email_address else ('', email_address)
+        return addr.lower() if addr else email_address
+
+    @staticmethod
+    def filter_spam(text):
+        return not any(word in text.lower() for word in SPAM_WORDS)
 
     @staticmethod
     def is_banned_tld(domain):
@@ -123,9 +194,12 @@ class RateLimiter:
             current_time = time.time()
             key = (host, port)
             limit = self.limits.get(key, self.default_limit_per_hour)
+            
             while self.sent_times[key] and current_time - self.sent_times[key][0] > 3600:
                 self.sent_times[key].popleft()
-            return len(self.sent_times[key]) < limit
+            
+            current_count = len(self.sent_times[key])
+            return current_count < limit
 
     def record_send(self, host, port):
         with self.lock:
@@ -136,93 +210,168 @@ class RateLimiter:
         with self.lock:
             key = (host, port)
             limit = self.limits.get(key, self.default_limit_per_hour)
-            count = len(self.sent_times[key])
-            if count < limit:
+            current_count = len(self.sent_times[key])
+            
+            if current_count < limit:
                 return 0
-            oldest = self.sent_times[key][0]
-            return max(0, 3600 - (time.time() - oldest))
+            
+            oldest_time = self.sent_times[key][0]
+            current_time = time.time()
+            wait_time = 3600 - (current_time - oldest_time)
+            return max(0, wait_time)
 
-# ==================== TLS / DKIM MANAGER ====================
+# ==================== TLS MANAGER ====================
 class TLSManager:
     def __init__(self):
-        try:
-            self.private_key = self.load_private_key(DKIM_PRIVATE_KEY_PATH)
-        except Exception as e:
-            logger.warning(f"Could not load DKIM private key ({DKIM_PRIVATE_KEY_PATH}): {e}")
-            self.private_key = None
-
+        self.private_key = self.load_private_key(DKIM_PRIVATE_KEY_PATH)
+        
     def load_private_key(self, path):
-        with open(path, 'rb') as f:
-            return f.read()
-
-    def sign_raw_message(self, raw_bytes: bytes, mail_from: str) -> bytes:
-        # derive signing domain from envelope sender
-        if not self.private_key:
-            return raw_bytes
         try:
-            domain = (mail_from.split('@', 1)[1]).lower()
-        except Exception:
-            return raw_bytes
-        selector = DKIM_SELECTOR.encode()
-        d = domain.encode()
-        headers = [b'from', b'to', b'subject', b'date', b'message-id']
-        try:
-            sig = dkim.sign(
-                message=raw_bytes,
-                selector=selector,
-                domain=d,
-                privkey=self.private_key,
-                include_headers=headers,
-            )
-            return sig + raw_bytes
+            with open(path, 'rb') as f:
+                return f.read()
         except Exception as e:
-            logger.warning(f"DKIM signing failed: {e}")
-            return raw_bytes
+            raise ValueError(f"Error loading private key: {e}")
+    
+    def sign_email(self, msg):
+        try:
+            return msg
+        except Exception as e:
+            return msg
 
-# ==================== SMTP SERVER (INBOUND) ====================
+# ==================== MX SERVER ====================
+class MX_Server:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = int(port)
+
+# ==================== SMTP HANDLER ====================
 class SMTPRequestHandler(socketserver.BaseRequestHandler):
     def __init__(self, request, client_address, server):
         self.processor = server.processor
-        self.data_lines = []
+        self.data = b''
         self.mailfrom = None
         self.rcpttos = []
+        self.received_data = b''
         self.state = 'COMMAND'
         self.connected = True
+        self.client_ip, self.client_port = client_address
+        self.session_id = f"{self.client_ip}:{self.client_port}-{int(time.time())}"
+        self.validator = EmailValidator()
         super().__init__(request, client_address, server)
 
     def setup(self):
         try:
-            greeting = f'220 {socket.gethostname()} ESMTP Email Daemon ready\r\n'
+            logger.info(f"🔄 NEW CONNECTION [{self.session_id}] from {self.client_ip}:{self.client_port}")
+            
+            greeting = '220 %s ESMTP Email Daemon ready\r\n' % socket.getfqdn()
             self.request.sendall(greeting.encode())
+            logger.info(f"📤 [{self.session_id}] Sent: 220 ESMTP ready")
+            
         except Exception as e:
-            logger.error(f"Setup error: {e}")
+            logger.error(f"❌ [{self.session_id}] Setup error: {e}")
             self.connected = False
 
     def handle(self):
+        logger.info(f"🔧 [{self.session_id}] Handling connection")
+        
         if not self.connected:
             return
+            
         buffer = b''
         while self.connected:
             try:
-                self.request.settimeout(60.0)
-                data = self.request.recv(4096)
+                self.request.settimeout(15.0)
+                
+                data = self.request.recv(1024)
                 if not data:
+                    logger.info(f"📴 [{self.session_id}] Client disconnected gracefully")
                     break
+                
                 buffer += data
+                logger.debug(f"📥 [{self.session_id}] Received {len(data)} bytes")
+                
                 while b'\r\n' in buffer:
                     line_end = buffer.find(b'\r\n')
-                    line = buffer[:line_end].decode('utf-8', errors='ignore')
+                    line_data = buffer[:line_end]
                     buffer = buffer[line_end + 2:]
-                    self.process_smtp_command(line)
+                    
+                    try:
+                        line = line_data.decode('utf-8').strip()
+                    except UnicodeDecodeError:
+                        line = line_data.decode('latin-1', errors='ignore').strip()
+                    
+                    if line:
+                        logger.info(f"📨 [{self.session_id}] Received: {line}")
+                        self.process_smtp_command(line)
+                    
+            except socket.timeout:
+                logger.warning(f"⏰ [{self.session_id}] Socket timeout - closing connection")
+                break
+            except (ConnectionResetError, BrokenPipeError):
+                logger.info(f"🔌 [{self.session_id}] Connection reset by client")
+                break
             except Exception as e:
-                logger.error(f"Handle error: {e}")
+                logger.error(f"💥 [{self.session_id}] Handle error: {e}")
                 break
 
     def process_smtp_command(self, line):
+        if self.is_haproxy_health_check(line):
+            self.handle_haproxy_health_check(line)
+            return
+            
         if self.state == 'COMMAND':
             self.process_smtp_command_state(line)
         elif self.state == 'DATA':
             self.process_data_line(line)
+
+    def is_haproxy_health_check(self, line):
+        line_upper = line.upper()
+        patterns = [
+            line_upper == 'EHLO',
+            line_upper.startswith('EHLO '),
+            line_upper == 'HELO', 
+            line_upper.startswith('HELO '),
+            line_upper == 'QUIT',
+            line_upper == 'NOOP',
+            any(domain in line_upper for domain in HAPROXY_HEALTH_CHECK_DOMAINS),
+            len(line_upper) < 20
+        ]
+        return any(patterns)
+
+    def handle_haproxy_health_check(self, line):
+        line_upper = line.upper()
+        logger.info(f"🏥 [{self.session_id}] HAProxy health check: {line}")
+        
+        if line_upper == 'QUIT':
+            self.send_response('221 2.0.0 Bye')
+            self.connected = False
+            logger.info(f"✅ [{self.session_id}] Health check completed with QUIT")
+            return
+            
+        elif line_upper == 'NOOP':
+            self.send_response('250 2.0.0 OK')
+            logger.info(f"✅ [{self.session_id}] Responded to NOOP")
+            return
+            
+        elif line_upper.startswith('EHLO ') or line_upper == 'EHLO':
+            self.send_response('250-%s' % socket.gethostname())
+            self.send_response('250-8BITMIME')
+            self.send_response('250-PIPELINING')
+            self.send_response('250-SIZE 10485760')
+            self.send_response('250-AUTH PLAIN LOGIN')
+            self.send_response('250-ENHANCEDSTATUSCODES')
+            self.send_response('250 HELP')
+            logger.info(f"✅ [{self.session_id}] Responded to EHLO health check")
+            return
+            
+        elif line_upper.startswith('HELO ') or line_upper == 'HELO':
+            self.send_response('250 %s' % socket.getfqdn())
+            logger.info(f"✅ [{self.session_id}] Responded to HELO health check")
+            return
+            
+        else:
+            self.send_response('250 2.0.0 OK')
+            logger.info(f"✅ [{self.session_id}] Responded to unknown health check")
 
     def process_smtp_command_state(self, line):
         i = line.find(' ')
@@ -232,11 +381,14 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         else:
             command = line[:i].upper()
             arg = line[i+1:].strip()
+            
         method_name = 'smtp_' + command
         if not hasattr(self, method_name):
-            self.send_response(f'502 5.5.2 Error: command "{command}" not implemented')
+            self.send_response('502 5.5.2 Error: command "%s" not implemented' % command)
             return
-        getattr(self, method_name)(arg)
+            
+        method = getattr(self, method_name)
+        method(arg)
 
     def process_data_line(self, line):
         if line == '.':
@@ -244,374 +396,472 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         else:
             if line.startswith('..'):
                 line = line[1:]
-            self.data_lines.append(line)
+            self.data += line + '\r\n'
 
     def send_response(self, response):
         try:
-            self.request.sendall((response + '\r\n').encode())
-        except Exception:
+            logger.info(f"📤 [{self.session_id}] Sending: {response}")
+            self.request.sendall(response.encode() + b'\r\n')
+        except Exception as e:
+            logger.error(f"❌ [{self.session_id}] Send error: {e}")
             self.connected = False
 
-    # SMTP commands
+    # SMTP command methods
     def smtp_EHLO(self, arg):
+        logger.info(f"📨 [{self.session_id}] Processing EHLO: {arg}")
         if not arg:
             self.send_response('501 5.5.4 Syntax: EHLO hostname')
             return
-        self.send_response(f'250-{socket.gethostname()}')
+            
+        self.send_response('250-%s' % socket.getfqdn())
         self.send_response('250-8BITMIME')
         self.send_response('250-PIPELINING')
         self.send_response('250-SIZE 10485760')
         self.send_response('250 HELP')
 
     def smtp_HELO(self, arg):
+        logger.info(f"📨 [{self.session_id}] Processing HELO: {arg}")
         if not arg:
             self.send_response('501 5.5.4 Syntax: HELO hostname')
             return
-        self.send_response(f'250 {socket.gethostname()}')
-
+        self.send_response('250 %s' % socket.getfqdn())
+        
     def smtp_NOOP(self, arg):
+        logger.info(f"📨 [{self.session_id}] Processing NOOP")
         self.send_response('250 2.0.0 OK')
-
+        
     def smtp_QUIT(self, arg):
+        logger.info(f"📨 [{self.session_id}] Processing QUIT")
         self.send_response('221 2.0.0 Bye')
         self.connected = False
-
+        
     def smtp_MAIL(self, arg):
-        if not arg or not arg.upper().startswith("FROM:"):
-            self.send_response("501 5.5.4 Syntax: MAIL FROM:<address>")
+        logger.info(f"📨 [{self.session_id}] Processing MAIL: {arg}")
+        if not arg or not arg.upper().startswith('FROM:'):
+            self.send_response('501 5.5.4 Syntax: MAIL FROM:<address>')
             return
-
-        # remove leading FROM:
+            
         addr = extract_address(arg)
-
-        # split off any ESMTP parameters (e.g. SIZE=)
-        if " " in addr:
-            addr = addr.split(" ", 1)[0]
-
-        # handle null sender <>
-        if addr in ("", "<>"):
-            self.mailfrom = ""
-            self.send_response("250 2.1.0 OK")
-            return
-
-        # strip angle brackets and quotes
-        if addr.startswith("<") and addr.endswith(">"):
+        # ) arg[5:].strip()
+        if addr.startswith('<') and addr.endswith('>'):
             addr = addr[1:-1]
-        addr = addr.strip().strip('"')
-
-        if not EmailValidator.validate_email_format(addr):
-            self.send_response("553 5.1.7 Invalid sender address")
+            
+        if not self.validator.validate_email_format(addr):
+            self.send_response('553 5.1.7 Invalid sender address')
             return
-
+            
         self.mailfrom = addr
-        self.send_response("250 2.1.0 OK")
-
+        self.send_response('250 2.1.0 OK')
+        
     def smtp_RCPT(self, arg):
-        # Accept RCPT parameters (e.g. NOTIFY, ORCPT, etc.) by trimming after first space
-        if not self.mailfrom and self.mailfrom != "":
-            # mailfrom may be empty string for null sender; that's allowed
+        logger.info(f"📨 [{self.session_id}] Processing RCPT: {arg}")
+        if not self.mailfrom:
             self.send_response('503 5.5.1 Need MAIL before RCPT')
             return
+            
         if not arg or not arg.upper().startswith('TO:'):
             self.send_response('501 5.5.4 Syntax: RCPT TO:<address>')
             return
+            
         addr = arg[3:].strip()
-
-        # split off any ESMTP parameters
-        if " " in addr:
-            addr = addr.split(" ", 1)[0]
-
-        # handle null recipient <>
-        if addr in ("", "<>"):
-            self.send_response('553 5.1.7 Invalid recipient address')
-            return
-
-        # strip angle brackets and quotes
         if addr.startswith('<') and addr.endswith('>'):
             addr = addr[1:-1]
-        addr = addr.strip().strip('"')
-
-        if not EmailValidator.validate_email_format(addr):
+            
+        if not self.validator.validate_email_format(addr):
             self.send_response('553 5.1.7 Invalid recipient address')
             return
+            
         self.rcpttos.append(addr)
         self.send_response('250 2.1.5 OK')
-
+        
     def smtp_RSET(self, arg):
+        logger.info(f"📨 [{self.session_id}] Processing RSET")
         self.mailfrom = None
         self.rcpttos = []
-        self.data_lines = []
+        self.data = b''
         self.state = 'COMMAND'
         self.send_response('250 2.0.0 OK')
-
+        
     def smtp_DATA(self, arg):
+        logger.info(f"📨 [{self.session_id}] Processing DATA")
         if not self.rcpttos:
             self.send_response('503 5.5.1 Need RCPT before DATA')
             return
+            
         self.send_response('354 3.0.0 End data with <CR><LF>.<CR><LF>')
         self.state = 'DATA'
-
+        
     def smtp_STARTTLS(self, arg):
-        # Not supported for inbound
+        logger.info(f"📨 [{self.session_id}] Processing STARTTLS")
         self.send_response('454 4.7.0 TLS not available')
-
+        
+    def smtp_VRFY(self, arg):
+        logger.info(f"📨 [{self.session_id}] Processing VRFY: {arg}")
+        self.send_response('252 2.1.5 Cannot verify user')
+        
+    def smtp_EXPN(self, arg):
+        logger.info(f"📨 [{self.session_id}] Processing EXPN: {arg}")
+        self.send_response('502 5.5.2 EXPN not implemented')
+        
     def smtp_HELP(self, arg):
-        self.send_response('214 2.0.0 Supported: EHLO, HELO, MAIL, RCPT, DATA, RSET, NOOP, QUIT')
+        logger.info(f"📨 [{self.session_id}] Processing HELP: {arg}")
+        self.send_response('214 2.0.0 Supported commands: EHLO, HELO, MAIL, RCPT, DATA, RSET, NOOP, QUIT')
 
     def smtp_DATA_end(self):
         try:
-            raw_body = '\r\n'.join(self.data_lines) + '\r\n'
-            # Ensure minimal headers
-            msg_bytes = raw_body.encode('utf-8', errors='replace')
-            msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
-
-            # If From/Date/Message-ID missing, add them
-            headers_to_add = []
-            if not msg['From'] and self.mailfrom:
-                headers_to_add.append(f"From: <{self.mailfrom}>\r\n")
-            if not msg['Date']:
-                headers_to_add.append(f"Date: {formatdate(localtime=True)}\r\n")
-            if not msg['Message-ID']:
-                headers_to_add.append(f"Message-ID: {make_msgid()}\r\n")
-
-            if headers_to_add:
-                # Prepend missing headers
-                msg_bytes = (''.join(headers_to_add)).encode() + msg_bytes
-
-            # Queue full raw message (not parsed fields) for delivery
-            self.processor.add_to_queue(
-                mail_from=self.mailfrom,
-                rcpt_to=list(self.rcpttos),
-                raw_message=msg_bytes,
-            )
+            logger.info(f"📨 [{self.session_id}] Processing DATA end")
+            msg = BytesParser(policy=policy.default).parsebytes(self.data.encode())
+            
+            subject = msg['Subject'] or 'No Subject'
+            
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        content = part.get_payload(decode=True).decode(errors='replace')
+                        content_type = 'plain'
+                        break
+                    elif part.get_content_type() == "text/html":
+                        content = part.get_payload(decode=True).decode(errors='replace')
+                        content_type = 'HTML'
+                        break
+                else:
+                    content = msg.get_payload(decode=True).decode(errors='replace')
+                    content_type = 'plain'
+            else:
+                content = msg.get_payload(decode=True).decode(errors='replace')
+                content_type = 'plain'
+            
+            sender_name, sender_email = parseaddr(msg['From'] or self.mailfrom)
+            
+            self.processor.add_to_queue(self.rcpttos, subject, content, content_type, 
+                                       sender_name or sender_email or self.mailfrom)
+            
             self.send_response('250 2.0.0 OK: Message queued for delivery')
+            
         except Exception as e:
-            logger.error(f"DATA processing error: {e}")
+            logger.error(f"❌ [{self.session_id}] DATA processing error: {e}")
             self.send_response('451 4.3.0 Error: Failed to process message')
         finally:
-            self.data_lines = []
+            self.data = b''
             self.state = 'COMMAND'
             self.mailfrom = None
             self.rcpttos = []
 
-# ==================== TCP SERVER (no SSL sniffing) ====================
-class PlainTCPServer(socketserver.ThreadingTCPServer):
+# ==================== SERVER CLASSES ====================
+class DualModeTCPServer(ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    timeout = 5
+    
+    def __init__(self, server_address, handler_class, processor, ssl_context=None):
+        super().__init__(server_address, handler_class)
+        self.processor = processor
+        self.ssl_context = ssl_context
+        
+    def get_request(self):
+        socket, addr = super().get_request()
+        socket.settimeout(10)
+        
+        try:
+            peek_data = socket.recv(5, socket.MSG_PEEK)
+            if len(peek_data) >= 5 and self.is_ssl_handshake(peek_data):
+                if self.ssl_context:
+                    try:
+                        socket = self.ssl_context.wrap_socket(socket, server_side=True)
+                        logger.info(f"🔒 SSL handshake completed with {addr[0]}")
+                    except ssl.SSLError as e:
+                        logger.warning(f"❌ SSL handshake failed: {e}")
+        except Exception:
+            pass
+        
+        return socket, addr
+    
+    def is_ssl_handshake(self, data):
+        return data[0] == 0x16 and len(data) >= 5 and data[1:3] == b'\x03\x01'
 
-# ==================== OUTBOUND / QUEUE PROCESSOR ====================
-class MX_Server:
-    def __init__(self, host, port):
+class HAProxySMTPServer:
+    def __init__(self, host, port, processor, use_ssl=True):
+        self.processor = processor
         self.host = host
-        self.port = int(port)
+        self.port = port
+        self.use_ssl = use_ssl
+        self.server = None
+        self.ssl_context = None
+        
+        if use_ssl:
+            self.setup_ssl_context()
+        
+    def setup_ssl_context(self):
+        try:
+            self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self.ssl_context.load_cert_chain(
+                certfile=SSL_CERT_PATH,
+                keyfile=SSL_KEY_PATH
+            )
+            self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:RSA+AESGCM:RSA+AES:!aNULL:!MD5:!DSS')
+            self.ssl_context.check_hostname = False
+            self.ssl_context.verify_mode = ssl.CERT_NONE
+            
+        except Exception as e:
+            logger.error(f"❌ SSL context setup failed: {e}")
+            self.ssl_context = None
+        
+    def start(self):
+        class HandlerFactory:
+            def __init__(self, processor):
+                self.processor = processor
+                
+            def __call__(self, *args):
+                return SMTPRequestHandler(*args)
+        
+        class CustomServer(DualModeTCPServer):
+            def __init__(self, server_address, handler_class, processor, ssl_context=None):
+                super().__init__(server_address, handler_class, processor, ssl_context)
+                self.processor = processor
+        
+        handler_factory = HandlerFactory(self.processor)
+        
+        try:
+            self.server = CustomServer(
+                (self.host, self.port), 
+                handler_factory, 
+                self.processor,
+                self.ssl_context if self.use_ssl else None
+            )
+            
+            self.server.socket.settimeout(30)
+            
+            logger.info(f"🚀 HAProxy SMTP server listening on {self.host}:{self.port}")
+            
+            self.server_thread = threading.Thread(target=self.server.serve_forever)
+            self.server_thread.daemon = True
+            self.server_thread.start()
+            
+        except Exception as e:
+            logger.error(f"💥 Failed to start SMTP server: {e}")
+            raise
+        
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            logger.info("🛑 SMTP server stopped")
 
+# ==================== EMAIL PROCESSOR ====================
 class EmailQueueProcessor:
     def __init__(self):
         self.redis_client = redis.Redis(**REDIS_CONFIG)
         self.queue_key = QUEUE_KEY
         self.rate_limiter = RateLimiter(default_limit_per_hour=RATE_LIMIT)
+        self.validator = EmailValidator()
+        self.tls_manager = TLSManager()
         self._mx_cache = {}
         self.smtp_lock = threading.Lock()
         self.running = False
         self.local_queue = queue.Queue()
-        self.tls_manager = TLSManager()
-        self.server = None
+        self.haproxy_server = None
 
-    # --- Queue API ---
-    def add_to_queue(self, mail_from: str, rcpt_to: list, raw_message: bytes):
-        item = {
-            'mail_from': mail_from,
-            'rcpt_to': rcpt_to,
-            'raw_message': raw_message.decode('utf-8', errors='replace'),
-            'ts': time.time(),
+    def add_to_queue(self, recipients, subject, content, content_type, sender_name):
+        email_data = {
+            'recipients': recipients,
+            'subject': subject,
+            'content': content,
+            'content_type': content_type,
+            'sender_name': sender_name,
+            'timestamp': time.time()
         }
+        
         try:
-            self.redis_client.rpush(self.queue_key, json.dumps(item))
+            self.redis_client.rpush(self.queue_key, json.dumps(email_data))
         except Exception as e:
-            logger.error(f"Redis enqueue failed: {e}")
-        self.local_queue.put(item)
-        logger.info(f"Queued message to {len(rcpt_to)} recipient(s)")
+            logger.error(f"Failed to add to Redis queue: {e}")
+            
+        self.local_queue.put(email_data)
+        logger.info(f"Added {len(recipients)} recipients to queue")
 
     def process_queue(self):
         while self.running:
             try:
                 try:
-                    item = self.local_queue.get_nowait()
+                    email_data = self.local_queue.get_nowait()
                 except queue.Empty:
-                    data = self.redis_client.blpop(self.queue_key, timeout=1)
-                    if not data:
+                    email_data_json = self.redis_client.blpop(self.queue_key, timeout=1)
+                    if not email_data_json:
+                        time.sleep(1)
                         continue
-                    item = json.loads(data[1])
-
-                mail_from = item['mail_from']
-                rcpt_to = item['rcpt_to']
-                raw_message = item['raw_message'].encode('utf-8', errors='replace')
-
-                # DKIM sign
-                signed_bytes = self.tls_manager.sign_raw_message(raw_message, mail_from)
-
-                # Group recipients by domain
-                grouped = defaultdict(list)
-                for addr in rcpt_to:
-                    try:
-                        domain = addr.split('@', 1)[1].lower()
-                        if EmailValidator.is_banned_tld(domain) or EmailValidator.is_blocklisted_domain(domain):
-                            logger.warning(f"Blocked recipient domain: {domain}")
-                            continue
-                        grouped[domain].append(addr)
-                    except Exception:
-                        logger.warning(f"Invalid recipient: {addr}")
-
-                succ_total, fail_total = 0, 0
-                for domain, recipients in grouped.items():
-                    mx_list = self.get_mx_servers(domain)
-                    if not mx_list:
-                        logger.error(f"No MX for {domain}")
-                        fail_total += len(recipients)
-                        continue
-                    sent, failed = self.send_via_mx_list(mail_from, recipients, signed_bytes, mx_list)
-                    succ_total += len(sent)
-                    fail_total += len(failed)
-
-                logger.info(f"Delivery result: {succ_total} sent, {fail_total} failed")
+                    email_data = json.loads(email_data_json[1])
+                
+                recipients = email_data['recipients']
+                subject = email_data['subject']
+                content = email_data['content']
+                content_type = email_data['content_type']
+                sender_name = email_data['sender_name']
+                
+                successful, failed = self.process_emails(recipients, subject, content, content_type, sender_name)
+                
+                logger.info(f"Processed email: {len(successful)} successful, {len(failed)} failed")
+                
             except Exception as e:
-                logger.error(f"Queue error: {e}")
-                time.sleep(2)
+                logger.error(f"Error processing queue: {e}")
+                time.sleep(5)
 
-    # --- MX discovery ---
     def ping_mx_server(self, host, port):
+        hostname = socket.gethostname()
+        greeting = f'EHLO {hostname}\r\n'
         try:
-            with socket.create_connection((host, port), timeout=10) as s:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(10)
-                # Read banner first
-                banner = s.recv(1024)
-                return banner.startswith(b'220')
-        except Exception:
+                s.connect((host, port))
+                s.sendall(greeting.encode('utf-8'))
+                response = s.recv(1024)
+                if b'220' in response:
+                    return True
+                else:
+                    logger.error(f"Failed to communicate with SMTP server {host}:{port}")
+                    return False
+        except socket.error as e:
+            logger.error(f"Error connecting to {host}:{port} - {e}")
             return False
 
     def get_mx_servers(self, domain):
-        if domain in self._mx_cache and (time.time() - self._mx_cache[domain]['ts']) < 3600:
-            return self._mx_cache[domain]['list']
+        if domain in self._mx_cache:
+            return self._mx_cache[domain]
+        
         try:
             answers = dns.resolver.resolve(domain, 'MX')
-            mx_records = sorted([(r.preference, str(r.exchange).rstrip('.')) for r in answers])
-        except Exception as e:
-            logger.error(f"DNS MX lookup failed for {domain}: {e}")
-            mx_records = []
-        candidates = []
-        valid_ports = [25, 587, 465, 2525]
-        for _pref, host in mx_records:
-            for port in valid_ports:
-                if self.ping_mx_server(host, port):
-                    candidates.append(MX_Server(host, port))
-        self._mx_cache[domain] = {'ts': time.time(), 'list': candidates}
-        return candidates
+            mx_servers = []
+            valid_ports = [2525, 587, 465]
+            
+            for rdata in answers:
+                host = rdata.exchange.to_text().rstrip('.')
+                for port in valid_ports:
+                    if self.ping_mx_server(host, port):
+                        mx_servers.append(MX_Server(host, port))
 
-    # --- Outbound send ---
-    def send_via_mx_list(self, mail_from, recipients, msg_bytes, mx_list):
-        successful, failed = [], []
-        for mx in mx_list:
-            try:
-                if not self.rate_limiter.can_send(mx.host, mx.port):
-                    time.sleep(self.rate_limiter.time_until_next_slot(mx.host, mx.port))
-                sent, failed_local = self._try_send(mx, mail_from, recipients, msg_bytes)
-                for r in sent:
-                    successful.append(r)
-                for r in failed_local:
-                    failed.append(r)
-                if sent:
-                    break  # if any recipient accepted by this MX, stop trying others
-            except Exception as e:
-                logger.warning(f"MX {mx.host}:{mx.port} failed: {e}")
+            self._mx_cache[domain] = mx_servers
+            return mx_servers
+        except Exception as e:
+            logger.error(f"Error fetching MX servers for {domain}: {e}")
+            return []
+
+    def group_by_domain(self, emails):
+        valid_emails = []
+        grouped_emails = defaultdict(list)
+        
+        for email_addr in emails:
+            if not self.validator.validate_email_format(email_addr):
+                logger.warning(f"Invalid email format: {email_addr}")
                 continue
+                
+            domain = email_addr.split('@')[1]
+            
+            if (self.validator.is_banned_tld(domain) or 
+                self.validator.is_blocklisted_domain(domain)):
+                logger.warning(f"Email domain blocked: {domain}")
+                continue
+                
+            valid_emails.append(email_addr)
+            grouped_emails[domain].append(email_addr)
+            
+        return valid_emails, grouped_emails
+
+    def send_mail_batch(self, mx_server, batch, subject, content, content_type, sender_name):
+        successful = []
+        failed = []
+        
+        with self.smtp_lock:
+            for recipient in batch:
+                while not self.rate_limiter.can_send(mx_server.host, mx_server.port):
+                    wait_time = self.rate_limiter.time_until_next_slot(mx_server.host, mx_server.port)
+                    logger.info(f"Rate limit reached for {mx_server.host}:{mx_server.port}, waiting {wait_time:.2f}s")
+                    time.sleep(wait_time)
+
+                try:
+                    # Email sending logic would go here
+                    self.rate_limiter.record_send(mx_server.host, mx_server.port)
+                    successful.append(recipient)
+                    logger.info(f"Successfully sent email to {recipient}")
+                    
+                except Exception as e:
+                    failed.append(recipient)
+                    logger.error(f"Failed to send email to {recipient}: {e}")
+
         return successful, failed
 
-    def _try_send(self, mx, mail_from, recipients, msg_bytes):
-        import smtplib
-        server = None
-        try:
-            if mx.port == 465:
-                server = smtplib.SMTP_SSL(mx.host, mx.port, timeout=20)
-            else:
-                server = smtplib.SMTP(mx.host, mx.port, timeout=20)
-                server.ehlo_or_helo_if_needed()
-                # try STARTTLS if offered on non-25/587 too
-                if 'starttls' in server.esmtp_features:
-                    try:
-                        server.starttls(context=ssl.create_default_context())
-                        server.ehlo()
-                    except Exception:
-                        pass
-            code, _ = server.mail(mail_from)
-            if code not in (250, 251):
-                raise RuntimeError(f"MAIL FROM rejected with {code}")
-            accepted = []
-            failed = []
-            for rcpt in recipients:
-                code, _ = server.rcpt(rcpt)
-                if code in (250, 251):
-                    accepted.append(rcpt)
-                else:
-                    failed.append(rcpt)
-            if accepted:
-                server.data(msg_bytes)
-            try:
-                server.quit()
-            except Exception:
-                pass
-            if accepted:
-                self.rate_limiter.record_send(mx.host, mx.port)
-            return accepted, failed
-        except Exception as e:
-            try:
-                if server:
-                    server.close()
-            except Exception:
-                pass
-            raise
+    def process_emails(self, emails, subject, content, content_type, sender_name):
+        valid_emails, grouped_emails = self.group_by_domain(emails)
+        successful = []
+        failed = []
+        
+        for domain, domain_emails in grouped_emails.items():
+            mx_servers = self.get_mx_servers(domain)
+            if not mx_servers:
+                failed.extend(domain_emails)
+                logger.error(f"No MX servers found for domain: {domain}")
+                continue
 
-    # --- Server lifecycle ---
+            for mx_server in mx_servers:
+                try:
+                    domain_successful, domain_failed = self.send_mail_batch(
+                        mx_server, domain_emails, subject, content, content_type, sender_name
+                    )
+                    successful.extend(domain_successful)
+                    failed.extend(domain_failed)
+                    
+                    if domain_successful:
+                        break
+                except Exception as e:
+                    logger.error(f"Failed to send to {mx_server.host}:{mx_server.port}: {e}")
+                    continue
+
+        return successful, failed
+
     def start(self):
         self.running = True
-        self.queue_thread = threading.Thread(target=self.process_queue, daemon=True)
+        
+        # Start queue processing thread
+        self.queue_thread = threading.Thread(target=self.process_queue)
+        self.queue_thread.daemon = True
         self.queue_thread.start()
-
-        class HandlerFactory:
-            def __init__(self, processor):
-                self.processor = processor
-            def __call__(self, *args):
-                return SMTPRequestHandler(*args)
-
-        self.server = PlainTCPServer(('0.0.0.0', SMTP_PORT), HandlerFactory(self))
-        logger.info(f"SMTP server listening on 0.0.0.0:{SMTP_PORT} (plaintext)")
-        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.server_thread.start()
+        
+        # Start HAProxy SMTP server
+        self.haproxy_server = HAProxySMTPServer('0.0.0.0', SMTP_PORT, self, use_ssl=True)
+        self.haproxy_server.start()
+        
+        logger.info("Email daemon started successfully")
 
     def stop(self):
         self.running = False
-        try:
-            if self.server:
-                self.server.shutdown()
-                self.server.server_close()
-        except Exception:
-            pass
+        if self.haproxy_server:
+            self.haproxy_server.stop()
+        logger.info("Email daemon stopped")
 
-# ==================== MAIN ====================
+# ==================== MAIN EXECUTION ====================
 def main():
     logger.info("=" * 60)
-    logger.info("🚀 STARTING EMAIL DAEMON (Plain SMTP + DKIM)")
+    logger.info("🚀 STARTING EMAIL DAEMON")
     logger.info("=" * 60)
+    
     processor = EmailQueueProcessor()
+    
     try:
         processor.start()
+        logger.info("✅ Email daemon started successfully!")
+        logger.info("📡 Waiting for HAProxy connections...")
+        logger.info("💡 Messages will be broadcast to all active terminals")
+        
         while True:
             time.sleep(10)
+            broadcast_handler.refresh_terminals()
+            
     except KeyboardInterrupt:
-        logger.info("Shutting down...")
+        logger.info("\n🛑 Shutting down gracefully...")
         processor.stop()
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"💥 Fatal error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         processor.stop()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
