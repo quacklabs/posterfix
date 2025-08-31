@@ -166,7 +166,7 @@ User=$SERVICE_USER
 Group=$SERVICE_USER
 WorkingDirectory=$PROJECT_DIR
 Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=$VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py
+ExecStart=$VENV_DIR/bin/python $PROJECT_DIR/main.py
 Restart=always
 RestartSec=5s
 Environment=PYTHONUNBUFFERED=1
