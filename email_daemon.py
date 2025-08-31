@@ -78,8 +78,8 @@ logger.addHandler(stream_handler)
 class EmailValidator:
     @staticmethod
     def validate_email_format(email_address: str) -> bool:
-        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        return re.match(pattern, email_address or '') is not None
+        pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+	    return re.match(pattern, email) is not None
 
     @staticmethod
     def is_banned_tld(domain):
