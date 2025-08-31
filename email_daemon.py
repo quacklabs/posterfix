@@ -224,19 +224,47 @@ class RateLimiter:
 class TLSManager:
     def __init__(self):
         self.private_key = self.load_private_key(DKIM_PRIVATE_KEY_PATH)
-        
+
     def load_private_key(self, path):
         try:
             with open(path, 'rb') as f:
                 return f.read()
         except Exception as e:
             raise ValueError(f"Error loading private key: {e}")
-    
-    def sign_email(self, msg):
+
+    def sign_email(self, message_bytes: bytes, signing_domain: str, selector: str = 'default') -> bytes:
+        """
+        Sign the provided full email message bytes using DKIM and return the signed message bytes
+        (DKIM-Signature header + original message).
+        - message_bytes: full RFC 2822 message bytes
+        - signing_domain: domain to use in the DKIM signature (example: example.com)
+        - selector: DKIM selector (default 'default')
+        """
         try:
-            return msg
+            if not self.private_key:
+                logger.warning("No DKIM private key loaded; skipping DKIM signing")
+                return message_bytes
+
+            # Minimal include headers - these are commonly signed
+            include_headers = [b"From", b"To", b"Subject", b"Date", b"Message-ID"]
+
+            sig = dkim.sign(
+                message_bytes,
+                selector=selector.encode('ascii'),
+                domain=signing_domain.encode('ascii'),
+                privkey=self.private_key,
+                include_headers=include_headers,
+                canonicalize=(b"relaxed", b"simple")
+            )
+
+            # dkim.sign returns raw bytes like b"DKIM-Signature: ...\r\n"
+            signed = sig + message_bytes
+            return signed
         except Exception as e:
-            return msg
+            logger.error(f"❌ DKIM signing failed for domain {signing_domain}: {e}")
+            return message_bytes
+
+
 
 # ==================== MX SERVER ====================
 class MX_Server:
@@ -765,28 +793,99 @@ class EmailQueueProcessor:
             
         return valid_emails, grouped_emails
 
+    
     def send_mail_batch(self, mx_server, batch, subject, content, content_type, sender_name):
-        successful = []
-        failed = []
-        
-        with self.smtp_lock:
-            for recipient in batch:
-                while not self.rate_limiter.can_send(mx_server.host, mx_server.port):
-                    wait_time = self.rate_limiter.time_until_next_slot(mx_server.host, mx_server.port)
-                    logger.info(f"Rate limit reached for {mx_server.host}:{mx_server.port}, waiting {wait_time:.2f}s")
-                    time.sleep(wait_time)
+    successful = []
+    failed = []
 
-                try:
-                    # Email sending logic would go here
-                    self.rate_limiter.record_send(mx_server.host, mx_server.port)
-                    successful.append(recipient)
-                    logger.info(f"Successfully sent email to {recipient}")
-                    
-                except Exception as e:
-                    failed.append(recipient)
-                    logger.error(f"Failed to send email to {recipient}: {e}")
+    # Determine envelope-from (use sender_name if it's an email, else use fallback)
+    if isinstance(sender_name, str) and '@' in sender_name:
+        envelope_from = sender_name
+    else:
+        envelope_from = f"no-reply@{socket.getfqdn()}"
 
-        return successful, failed
+    for recipient in batch:
+        try:
+            # Rate limiting
+            while not self.rate_limiter.can_send(mx_server.host, mx_server.port):
+                wait_time = self.rate_limiter.time_until_next_slot(mx_server.host, mx_server.port)
+                logger.info(f"Rate limit reached for {mx_server.host}:{mx_server.port}, waiting {wait_time:.2f}s")
+                time.sleep(wait_time)
+
+            logger.info(f"➡️ Connecting to MX {mx_server.host}:{mx_server.port} for recipient {recipient}")
+
+            # Build MIME message
+            msg = MIMEMultipart('alternative')
+            msg['From'] = envelope_from
+            msg['To'] = recipient
+            msg['Subject'] = subject
+            msg['Message-ID'] = email.utils.make_msgid()
+            msg['Date'] = email.utils.formatdate(localtime=True)
+
+            if content_type.lower() == 'html' or content_type.lower() == 'html':
+                part = MIMEText(content, 'html')
+            else:
+                part = MIMEText(content, 'plain')
+            msg.attach(part)
+
+            # Prepare raw message bytes for DKIM signing
+            raw = msg.as_bytes(policy=policy.SMTP)
+
+            # Determine DKIM signing domain (attempt to use envelope domain)
+            try:
+                signing_domain = envelope_from.split('@', 1)[1]
+            except Exception:
+                signing_domain = socket.getfqdn()
+
+            # DKIM sign
+            signed_message = self.tls_manager.sign_email(raw, signing_domain, selector='default')
+
+            smtp = None
+            try:
+                # Choose SSL vs plain
+                if mx_server.port == 465:
+                    smtp = smtplib.SMTP_SSL(mx_server.host, mx_server.port, timeout=20)
+                    logger.info(f"🔒 Connected with SSL to {mx_server.host}:{mx_server.port}")
+                else:
+                    smtp = smtplib.SMTP(mx_server.host, mx_server.port, timeout=20)
+                    smtp.ehlo()
+                    logger.info(f"✅ Connected to {mx_server.host}:{mx_server.port}, ehlo complete")
+                    # Try STARTTLS if available
+                    try:
+                        if smtp.has_extn('STARTTLS'):
+                            smtp.starttls()
+                            smtp.ehlo()
+                            logger.info(f"🔐 STARTTLS negotiated with {mx_server.host}:{mx_server.port}")
+                    except Exception as e:
+                        logger.debug(f"STARTTLS not used/failed for {mx_server.host}:{mx_server.port}: {e}")
+
+                # Send the message
+                # smtplib in Python 3.12 accepts bytes payloads. If you encounter issues,
+                # convert to str with appropriate encoding (but that can break DKIM).
+                smtp.sendmail(envelope_from, [recipient], signed_message)
+                self.rate_limiter.record_send(mx_server.host, mx_server.port)
+                successful.append(recipient)
+                logger.info(f"📤 Successfully sent email to {recipient} via {mx_server.host}:{mx_server.port}")
+
+            except Exception as e:
+                failed.append(recipient)
+                logger.error(f"❌ Failed sending to {recipient} via {mx_server.host}:{mx_server.port}: {e}")
+            finally:
+                if smtp:
+                    try:
+                        smtp.quit()
+                    except Exception:
+                        try:
+                            smtp.close()
+                        except Exception:
+                            pass
+
+        except Exception as e:
+            failed.append(recipient)
+            logger.error(f"❌ Unexpected error preparing to send to {recipient}: {e}")
+
+    return successful, failed
+
 
     def process_emails(self, emails, subject, content, content_type, sender_name):
         valid_emails, grouped_emails = self.group_by_domain(emails)
