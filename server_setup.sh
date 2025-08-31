@@ -273,8 +273,10 @@ echo ""
 cd ~
 
 # Configure HAProxy for TCP load balancing outgoing to relays (replace relay IPs)
-cat $CERT_DIR/fullchain.pem > /etc/haproxy/ca.crt
-cat $CERT_DIR/$DOMAIN.key > /etc/haproxy/ca.crt.key
+sudo cat $CERT_DIR/fullchain.pem $CERT_DIR/$DOMAIN.key > /etc/haproxy/cert.pem
+sudo chmod 600 /etc/haproxy/cert.pem
+sudo chown haproxy:haproxy /etc/haproxy/cert.pem
+
 cat <<EOF > /etc/haproxy/haproxy.cfg
 global
     log /dev/log local0
@@ -293,7 +295,9 @@ defaults
     timeout connect 5s
     timeout client 1m
     timeout server 1m
-
+frontend https_in
+    bind *:443 ssl crt /etc/haproxy/cert.pem
+    
 frontend outgoing_smtp
     bind *:2525
     default_backend relay_servers
