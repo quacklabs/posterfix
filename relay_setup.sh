@@ -7,6 +7,7 @@ SCP_PASSWORD="Exc@libur"
 PROJECT_DIR="/opt/email_daemon"
 SERVICE_USER="emaildaemon"
 VENV_DIR="$PROJECT_DIR/venv"
+LOG_DIR="/var/log/email_daemon"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -43,25 +44,14 @@ sudo chown $USER:$USER $PROJECT_DIR
 echo "Copying project files..."
 cp -r ./* $PROJECT_DIR/
 
-# Step 1.5: Fix asyncore import issue in the Python script
-echo "Checking for asyncore import issues..."
-if grep -q "import asyncore" "$PROJECT_DIR/email_daemon.py"; then
-    echo "Found asyncore import. Fixing for Python 3.12 compatibility..."
-    
-    # Create backup
-    cp "$PROJECT_DIR/email_daemon.py" "$PROJECT_DIR/email_daemon.py.backup"
-    
-    # Replace asyncore with asyncio alternatives
-    sed -i 's/import asyncore/# import asyncore  # Removed in Python 3.12/g' "$PROJECT_DIR/email_daemon.py"
-    sed -i 's/asyncore\./asyncio./g' "$PROJECT_DIR/email_daemon.py"
-    
-    # Add asyncio import if not present
-    if ! grep -q "import asyncio" "$PROJECT_DIR/email_daemon.py"; then
-        sed -i '1i import asyncio' "$PROJECT_DIR/email_daemon.py"
-    fi
-    
-    echo "Asyncore imports fixed for Python 3.12"
-fi
+# Step 1.5: Fix log file path in the Python script
+echo "Fixing log file path..."
+sudo mkdir -p $LOG_DIR
+sudo chown $SERVICE_USER:$SERVICE_USER $LOG_DIR
+sudo chmod 755 $LOG_DIR
+
+# Update the log file path in the Python script
+sed -i "s|logging.FileHandler('email_daemon.log')|logging.FileHandler('$LOG_DIR/email_daemon.log')|g" "$PROJECT_DIR/email_daemon.py"
 
 # Create virtual environment
 echo "Creating Python virtual environment..."
@@ -74,7 +64,7 @@ pip install --upgrade pip
 
 # Install essential packages
 echo "Installing essential email packages..."
-pip install redis>=4.5.0 dkimpy>=1.1.8 aiosmtplib>=2.0.0 email-validator>=1.3.0 asyncio aiosmtpd
+pip install redis>=4.5.0 dkimpy>=1.1.8 aiosmtplib>=2.0.0 email-validator>=1.3.0 asyncio aiosmtpd dnspython
 
 # Check if requirements.txt exists and fix version issues
 if [ -f "$PROJECT_DIR/requirements.txt" ]; then
@@ -119,7 +109,7 @@ sudo systemctl start redis-server
 echo "Creating service user..."
 sudo useradd -r -s /usr/sbin/nologin -d $PROJECT_DIR $SERVICE_USER 2>/dev/null || true
 
-# Step 4: Configure DKIM and SSL keys
+# Step 4: Configure DKIM and SSL keys with proper permissions
 echo "Setting up DKIM and SSL keys..."
 sudo mkdir -p $KEYS_DIR
 
@@ -143,15 +133,22 @@ sshpass -p "$SCP_PASSWORD" ssh-copy-id -o StrictHostKeyChecking=no -i ~/.ssh/id_
 echo "Copying SSL and DKIM files from master server..."
 rsync -avz -e "ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa" "dkim-user@$MASTER:/etc/relays/" $KEYS_DIR/
 
-# Set proper permissions on keys
-sudo chown -R root:root $KEYS_DIR
-sudo chmod 600 $KEYS_DIR/*.key $KEYS_DIR/*.private
+# Set proper permissions on keys - allow service user to read them
+echo "Setting proper permissions on SSL keys..."
+sudo chown -R root:$SERVICE_USER $KEYS_DIR
+sudo chmod 640 $KEYS_DIR/*.key $KEYS_DIR/*.private
 sudo chmod 644 $KEYS_DIR/*.pem $KEYS_DIR/*.crt
+sudo chmod 750 $KEYS_DIR
 
-# Step 5: Set proper ownership of project directory
+# Step 5: Set proper ownership of project directory and log directory
 echo "Setting up project permissions..."
 sudo chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
 sudo chmod 755 $PROJECT_DIR
+
+# Create log directory with proper permissions
+sudo mkdir -p $LOG_DIR
+sudo chown -R $SERVICE_USER:$SERVICE_USER $LOG_DIR
+sudo chmod 755 $LOG_DIR
 
 # Step 6: Setup the systemd service for the daemon
 echo "Setting up systemd service..."
@@ -179,7 +176,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=$PROJECT_DIR $KEYS_DIR
+ReadWritePaths=$PROJECT_DIR $KEYS_DIR $LOG_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -196,10 +193,9 @@ import dkim
 import asyncio
 print('✓ All critical imports successful')
 print('Redis version:', redis.__version__)
-print('DKIM version:', dkim.__version__)
 "
 
-# Step 8: Test the actual script
+# Step 8: Test the actual script with proper permissions
 echo "Testing the email daemon script..."
 if sudo -u $SERVICE_USER $VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py --help 2>/dev/null; then
     echo "✓ Script test passed with --help flag"
@@ -210,7 +206,12 @@ else
     sudo -u $SERVICE_USER $VENV_DIR/bin/python -m py_compile $PROJECT_DIR/email_daemon.py && echo "✓ Script syntax is valid"
 fi
 
-# Step 9: Enable and start the service
+# Step 9: Test file permissions
+echo "Testing file permissions..."
+sudo -u $SERVICE_USER test -r "$KEYS_DIR/relay.private" && echo "✓ Service user can read private key" || echo "✗ Cannot read private key"
+sudo -u $SERVICE_USER test -w "$LOG_DIR" && echo "✓ Service user can write to log directory" || echo "✗ Cannot write to log directory"
+
+# Step 10: Enable and start the service
 echo "Enabling and starting the Email Daemon service..."
 sudo systemctl enable email_daemon.service
 sudo systemctl start email_daemon.service
@@ -218,7 +219,7 @@ sudo systemctl start email_daemon.service
 # Wait a moment for service to start
 sleep 5
 
-# Step 10: Check the status of the service
+# Step 11: Check the status of the service
 echo "Checking the status of the Email Daemon..."
 if sudo systemctl is-active --quiet email_daemon.service; then
     echo "✓ Service is running successfully!"
@@ -228,13 +229,34 @@ else
     sudo journalctl -u email_daemon.service -b --no-pager -n 30
     
     # Additional debugging
-    echo "Checking script for import issues..."
+    echo "Checking file permissions..."
+    sudo -u $SERVICE_USER ls -la $KEYS_DIR/ | head -5
+    sudo -u $SERVICE_USER ls -la $LOG_DIR/
+    
+    echo "Testing script with service user..."
     sudo -u $SERVICE_USER $VENV_DIR/bin/python -c "
 import sys
 sys.path.insert(0, '/opt/email_daemon')
 try:
-    from email_daemon import main
-    print('✓ Script can be imported successfully')
+    # Test basic imports without file operations
+    import redis
+    import dkim
+    print('✓ Basic imports work')
+    
+    # Test file access
+    try:
+        with open('/etc/ssl/default/relay.private', 'r') as f:
+            print('✓ Can read private key')
+    except Exception as e:
+        print('✗ Cannot read private key:', e)
+        
+    try:
+        with open('/var/log/email_daemon/test.log', 'w') as f:
+            f.write('test')
+            print('✓ Can write to log directory')
+    except Exception as e:
+        print('✗ Cannot write to log directory:', e)
+        
 except Exception as e:
     print('✗ Import error:', e)
     import traceback
@@ -245,4 +267,5 @@ fi
 echo "Setup complete!"
 echo "Virtual environment location: $VENV_DIR"
 echo "Project directory: $PROJECT_DIR"
+echo "Log directory: $LOG_DIR"
 echo "Service status: $(sudo systemctl is-active email_daemon.service)"
