@@ -14,14 +14,16 @@ import socket
 import threading
 import re
 import dns.resolver
-import asyncore
-import asynchat
 import email
 from email import policy
 from email.parser import BytesParser
 import json
 import queue
 import select
+import socketserver
+import threading
+import asyncio
+from socketserver import ThreadingMixIn
 
 # Configure logging
 logging.basicConfig(
@@ -34,30 +36,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger('EmailDaemon')
 
-class HAProxySMTPChannel(asynchat.async_chat):
-    """Custom SMTP channel for HAProxy connections"""
-    
-    def __init__(self, sock, addr, processor):
-        asynchat.async_chat.__init__(self, sock=sock)
-        self.set_terminator(b'\r\n')
-        self.processor = processor
+# Modern replacement for asyncore functionality
+class ThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+class SMTPRequestHandler(socketserver.BaseRequestHandler):
+    def __init__(self, request, client_address, server):
+        self.processor = server.processor
         self.data = b''
         self.mailfrom = None
         self.rcpttos = []
         self.received_data = b''
         self.state = 'COMMAND'
-        self.push('220 %s ESMTP Email Daemon ready' % socket.getfqdn())
-        
-    def collect_incoming_data(self, data):
-        self.received_data += data
-        
-    def found_terminator(self):
-        line = self.received_data.decode('utf-8').strip()
-        self.received_data = b''
-        
+        super().__init__(request, client_address, server)
+
+    def setup(self):
+        self.request.sendall(b'220 %s ESMTP Email Daemon ready\r\n' % socket.getfqdn().encode())
+
+    def handle(self):
+        while True:
+            try:
+                data = self.request.recv(1024)
+                if not data:
+                    break
+                    
+                self.received_data += data
+                if b'\r\n' in self.received_data:
+                    lines = self.received_data.split(b'\r\n')
+                    for line in lines[:-1]:
+                        self.process_line(line.decode('utf-8').strip())
+                    self.received_data = lines[-1]
+                    
+            except (ConnectionResetError, BrokenPipeError):
+                break
+            except Exception as e:
+                logger.error(f"Error handling request: {e}")
+                break
+
+    def process_line(self, line):
         if self.state == 'COMMAND':
             if not line:
-                self.push('500 Error: bad syntax')
+                self.send_response('500 Error: bad syntax')
                 return
                 
             i = line.find(' ')
@@ -70,108 +90,102 @@ class HAProxySMTPChannel(asynchat.async_chat):
                 
             method_name = 'smtp_' + command
             if not hasattr(self, method_name):
-                self.push('502 Error: command "%s" not implemented' % command)
+                self.send_response('502 Error: command "%s" not implemented' % command)
                 return
                 
             method = getattr(self, method_name)
             method(arg)
         elif self.state == 'DATA':
             if line == '.':
-                # End of data
                 self.smtp_DATA_end()
             else:
-                # Remove leading dot if present (SMTP transparency)
                 if line.startswith('..'):
                     line = line[1:]
                 self.data += line + '\r\n'
-                
+
+    def send_response(self, response):
+        self.request.sendall(response.encode() + b'\r\n')
+
     def smtp_EHLO(self, arg):
         if not arg:
-            self.push('501 Syntax: EHLO hostname')
+            self.send_response('501 Syntax: EHLO hostname')
             return
-        self.push('250-%s' % socket.getfqdn())
-        self.push('250-8BITMIME')
-        self.push('250-PIPELINING')
-        self.push('250-SIZE 10485760')
-        self.push('250 HELP')
+        self.send_response('250-%s' % socket.getfqdn())
+        self.send_response('250-8BITMIME')
+        self.send_response('250-PIPELINING')
+        self.send_response('250-SIZE 10485760')
+        self.send_response('250 HELP')
         
     def smtp_HELO(self, arg):
         if not arg:
-            self.push('501 Syntax: HELO hostname')
+            self.send_response('501 Syntax: HELO hostname')
             return
-        self.push('250 %s' % socket.getfqdn())
+        self.send_response('250 %s' % socket.getfqdn())
         
     def smtp_NOOP(self, arg):
-        self.push('250 OK')
+        self.send_response('250 OK')
         
     def smtp_QUIT(self, arg):
-        self.push('221 Bye')
-        self.close_when_done()
+        self.send_response('221 Bye')
+        self.request.close()
         
     def smtp_MAIL(self, arg):
         if not arg or not arg.upper().startswith('FROM:'):
-            self.push('501 Syntax: MAIL FROM:<address>')
+            self.send_response('501 Syntax: MAIL FROM:<address>')
             return
             
-        # Extract email address
         addr = arg[5:].strip()
         if addr.startswith('<') and addr.endswith('>'):
             addr = addr[1:-1]
             
-        # Validate email
         if not self.processor.validator.validate_email_format(addr):
-            self.push('553 Invalid sender address')
+            self.send_response('553 Invalid sender address')
             return
             
         self.mailfrom = addr
-        self.push('250 OK')
+        self.send_response('250 OK')
         
     def smtp_RCPT(self, arg):
         if not self.mailfrom:
-            self.push('503 Need MAIL before RCPT')
+            self.send_response('503 Need MAIL before RCPT')
             return
             
         if not arg or not arg.upper().startswith('TO:'):
-            self.push('501 Syntax: RCPT TO:<address>')
+            self.send_response('501 Syntax: RCPT TO:<address>')
             return
             
-        # Extract email address
         addr = arg[3:].strip()
         if addr.startswith('<') and addr.endswith('>'):
             addr = addr[1:-1]
             
-        # Validate email
         if not self.processor.validator.validate_email_format(addr):
-            self.push('553 Invalid recipient address')
+            self.send_response('553 Invalid recipient address')
             return
             
         self.rcpttos.append(addr)
-        self.push('250 OK')
+        self.send_response('250 OK')
         
     def smtp_RSET(self, arg):
         self.mailfrom = None
         self.rcpttos = []
         self.data = b''
         self.state = 'COMMAND'
-        self.push('250 OK')
+        self.send_response('250 OK')
         
     def smtp_DATA(self, arg):
         if not self.rcpttos:
-            self.push('503 Need RCPT before DATA')
+            self.send_response('503 Need RCPT before DATA')
             return
             
-        self.push('354 End data with <CR><LF>.<CR><LF>')
+        self.send_response('354 End data with <CR><LF>.<CR><LF>')
         self.state = 'DATA'
         
     def smtp_DATA_end(self):
-        # Parse the email data
         try:
-            msg = BytesParser(policy=policy.default).parsebytes(self.data)
+            msg = BytesParser(policy=policy.default).parsebytes(self.data.encode())
             
-            # Extract subject and content
             subject = msg['Subject'] or 'No Subject'
             
-            # Get the body content
             if msg.is_multipart():
                 for part in msg.walk():
                     if part.get_content_type() == "text/plain":
@@ -183,25 +197,22 @@ class HAProxySMTPChannel(asynchat.async_chat):
                         content_type = 'HTML'
                         break
                 else:
-                    # Fallback to the first part
                     content = msg.get_payload(decode=True).decode(errors='replace')
                     content_type = 'plain'
             else:
                 content = msg.get_payload(decode=True).decode(errors='replace')
                 content_type = 'plain'
             
-            # Extract sender name
             sender_name, sender_email = parseaddr(msg['From'] or self.mailfrom)
             
-            # Add to processing queue
             self.processor.add_to_queue(self.rcpttos, subject, content, content_type, 
                                        sender_name or sender_email or self.mailfrom)
             
-            self.push('250 OK: Message queued for delivery')
+            self.send_response('250 OK: Message queued for delivery')
             
         except Exception as e:
             logger.error(f"Error processing email data: {e}")
-            self.push('451 Error: Failed to process message')
+            self.send_response('451 Error: Failed to process message')
             
         finally:
             self.data = b''
@@ -209,24 +220,45 @@ class HAProxySMTPChannel(asynchat.async_chat):
             self.mailfrom = None
             self.rcpttos = []
 
-class HAProxySMTPServer(asyncore.dispatcher):
-    """SMTP server for HAProxy connections"""
+class HAProxySMTPServer:
+    """SMTP server for HAProxy connections using modern socketserver"""
     
     def __init__(self, host, port, processor):
-        asyncore.dispatcher.__init__(self)
         self.processor = processor
-        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.set_reuse_addr()
-        self.bind((host, port))
-        self.listen(5)
-        logger.info(f"HAProxy SMTP server listening on {host}:{port}")
+        self.host = host
+        self.port = port
+        self.server = None
         
-    def handle_accept(self):
-        pair = self.accept()
-        if pair is not None:
-            sock, addr = pair
-            logger.info(f"Incoming connection from {addr}")
-            HAProxySMTPChannel(sock, addr, self.processor)
+    def start(self):
+        """Start the SMTP server"""
+        class HandlerFactory:
+            def __init__(self, processor):
+                self.processor = processor
+                
+            def __call__(self, *args):
+                return SMTPRequestHandler(*args)
+        
+        # Create server with processor reference
+        class CustomServer(ThreadedTCPServer):
+            def __init__(self, server_address, handler_class, processor):
+                super().__init__(server_address, handler_class)
+                self.processor = processor
+        
+        handler_factory = HandlerFactory(self.processor)
+        self.server = CustomServer((self.host, self.port), handler_factory, self.processor)
+        
+        logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port}")
+        
+        # Start server in a separate thread
+        self.server_thread = threading.Thread(target=self.server.serve_forever)
+        self.server_thread.daemon = True
+        self.server_thread.start()
+        
+    def stop(self):
+        """Stop the SMTP server"""
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
 
 class RateLimiter:
     def __init__(self, default_limit_per_hour=DEFAULT_RATE_LIMIT):
@@ -249,7 +281,6 @@ class RateLimiter:
             key = (host, port)
             limit = self.limits.get(key, self.default_limit_per_hour)
             
-            # Clean up old entries
             while self.sent_times[key] and current_time - self.sent_times[key][0] > 3600:
                 self.sent_times[key].popleft()
             
@@ -319,6 +350,7 @@ class EmailQueueProcessor:
         self.smtp_lock = threading.Lock()
         self.running = False
         self.local_queue = queue.Queue()
+        self.haproxy_server = None
 
     def add_to_queue(self, recipients, subject, content, content_type, sender_name):
         """Add email to processing queue"""
@@ -331,7 +363,6 @@ class EmailQueueProcessor:
             'timestamp': time.time()
         }
         
-        # Add to both Redis and local queue for redundancy
         try:
             self.redis_client.rpush(self.queue_key, json.dumps(email_data))
         except Exception as e:
@@ -344,11 +375,9 @@ class EmailQueueProcessor:
         """Process emails from the queue"""
         while self.running:
             try:
-                # Try to get from local queue first
                 try:
                     email_data = self.local_queue.get_nowait()
                 except queue.Empty:
-                    # Fall back to Redis
                     email_data_json = self.redis_client.blpop(self.queue_key, timeout=1)
                     if not email_data_json:
                         time.sleep(1)
@@ -361,7 +390,6 @@ class EmailQueueProcessor:
                 content_type = email_data['content_type']
                 sender_name = email_data['sender_name']
                 
-                # Process the email
                 successful, failed = self.process_emails(recipients, subject, content, content_type, sender_name)
                 
                 logger.info(f"Processed email: {len(successful)} successful, {len(failed)} failed")
@@ -376,11 +404,11 @@ class EmailQueueProcessor:
         greeting = f'EHLO {hostname}\r\n'
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(10)  # Timeout after 10 seconds
-                s.connect((host, port))  # Try to connect to the host and port
+                s.settimeout(10)
+                s.connect((host, port))
                 s.sendall(greeting.encode('utf-8'))
-                response = s.recv(1024)  # Receive server response
-                if b'220' in response:  # Check for "220" SMTP greeting code
+                response = s.recv(1024)
+                if b'220' in response:
                     return True
                 else:
                     logger.error(f"Failed to communicate with SMTP server {host}:{port}")
@@ -395,16 +423,14 @@ class EmailQueueProcessor:
             return self._mx_cache[domain]
         
         try:
-            # Perform DNS lookup to get MX servers
             answers = dns.resolver.resolve(domain, 'MX')
             mx_servers = []
-            valid_ports = [2525, 587, 465]  # Your preferred ports only
+            valid_ports = [2525, 587, 465]
             
             for rdata in answers:
-                host = rdata.exchange.to_text().rstrip('.')  # Get the MX host
-                # Ping each MX server on the valid SMTP ports
+                host = rdata.exchange.to_text().rstrip('.')
                 for port in valid_ports:
-                    if self.ping_mx_server(host, port):  # Only add to list if it responds as SMTP
+                    if self.ping_mx_server(host, port):
                         mx_servers.append(MX_Server(host, port))
 
             self._mx_cache[domain] = mx_servers
@@ -419,15 +445,12 @@ class EmailQueueProcessor:
         grouped_emails = defaultdict(list)
         
         for email_addr in emails:
-            # Validate email format
             if not self.validator.validate_email_format(email_addr):
                 logger.warning(f"Invalid email format: {email_addr}")
                 continue
                 
-            # Extract domain
             domain = email_addr.split('@')[1]
             
-            # Check for banned TLDs and blocklisted domains
             if (self.validator.is_banned_tld(domain) or 
                 self.validator.is_blocklisted_domain(domain)):
                 logger.warning(f"Email domain blocked: {domain}")
@@ -445,14 +468,12 @@ class EmailQueueProcessor:
         
         with self.smtp_lock:
             for recipient in batch:
-                # Check rate limit
                 while not self.rate_limiter.can_send(mx_server.host, mx_server.port):
                     wait_time = self.rate_limiter.time_until_next_slot(mx_server.host, mx_server.port)
                     logger.info(f"Rate limit reached for {mx_server.host}:{mx_server.port}, waiting {wait_time:.2f}s")
                     time.sleep(wait_time)
 
                 try:
-                    # Create connection with appropriate settings
                     if mx_server.port == 465:
                         server = smtplib.SMTP_SSL(
                             host=mx_server.host, 
@@ -466,29 +487,24 @@ class EmailQueueProcessor:
                             port=mx_server.port, 
                             timeout=30
                         )
-                        if mx_server.port in [587, 2525]:  # Start TLS on submission ports
+                        if mx_server.port in [587, 2525]:
                             server.starttls(context=ssl.create_default_context())
 
-                    # Identify ourselves
                     server.ehlo_or_helo_if_needed()
 
-                    # Prepare message
                     msg = MIMEMultipart()
                     msg['From'] = formataddr((sender_name, f'{sender_name}@yourdomain.com'))
                     msg['To'] = recipient
                     msg['Subject'] = subject
                     msg['Date'] = email.utils.formatdate()
 
-                    # Add content
                     msg.attach(MIMEText(content, 'html' if content_type == 'HTML' else 'plain', 'utf-8'))
                     
-                    # Apply DKIM signing if available
                     try:
                         msg = self.tls_manager.sign_email(msg)
                     except Exception as e:
                         logger.warning(f"DKIM signing failed: {e}")
 
-                    # Send email
                     server.sendmail(f'{sender_name}@yourdomain.com', [recipient], msg.as_string())
                     self.rate_limiter.record_send(mx_server.host, mx_server.port)
                     server.quit()
@@ -515,7 +531,6 @@ class EmailQueueProcessor:
                 logger.error(f"No MX servers found for domain: {domain}")
                 continue
 
-            # Try each MX server until we find one that works
             for mx_server in mx_servers:
                 try:
                     domain_successful, domain_failed = self.send_mail_batch(
@@ -525,7 +540,7 @@ class EmailQueueProcessor:
                     failed.extend(domain_failed)
                     
                     if domain_successful:
-                        break  # Move to next domain if successful
+                        break
                 except Exception as e:
                     logger.error(f"Failed to send to {mx_server.host}:{mx_server.port}: {e}")
                     continue
@@ -543,17 +558,15 @@ class EmailQueueProcessor:
         
         # Start HAProxy SMTP server
         self.haproxy_server = HAProxySMTPServer('0.0.0.0', 3000, self)
-        
-        # Start asyncore loop in a separate thread
-        self.asyncore_thread = threading.Thread(target=asyncore.loop, kwargs={'timeout': 1})
-        self.asyncore_thread.daemon = True
-        self.asyncore_thread.start()
+        self.haproxy_server.start()
         
         logger.info("Email daemon started successfully")
 
     def stop(self):
         """Stop the queue processor"""
         self.running = False
+        if self.haproxy_server:
+            self.haproxy_server.stop()
         logger.info("Email daemon stopped")
 
 # Main execution
@@ -562,7 +575,6 @@ if __name__ == "__main__":
     
     try:
         processor.start()
-        # Keep the main thread alive
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
