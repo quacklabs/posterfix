@@ -36,40 +36,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger('EmailDaemon')
 
-
-#SMTP SSL
-class SSLThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
+# Modern TCP server without SSL
+class ThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
     timeout = 5  # Set socket timeout
     
-    def __init__(self, server_address, handler_class, processor, ssl_context=None):
+    def __init__(self, server_address, handler_class, processor):
         super().__init__(server_address, handler_class)
         self.processor = processor
-        self.ssl_context = ssl_context
         
     def get_request(self):
         socket, addr = super().get_request()
         socket.settimeout(5)  # Set timeout on the socket
-        
-        if self.ssl_context:
-            try:
-                # HAProxy expects immediate SSL - don't wait for STARTTLS
-                socket = self.ssl_context.wrap_socket(socket, server_side=True)
-                logger.debug(f"SSL handshake completed with {addr}")
-            except ssl.SSLError as e:
-                logger.warning(f"SSL handshake failed with {addr}: {e}")
-                # Try to send SMTP response even if SSL fails
-                try:
-                    socket.sendall(b'220 ESMTP Email Daemon ready\r\n')
-                except:
-                    pass
-                socket.close()
-                raise
-            except Exception as e:
-                logger.error(f"Error wrapping socket with SSL: {e}")
-                socket.close()
-                raise
         return socket, addr
 
 class SMTPRequestHandler(socketserver.BaseRequestHandler):
@@ -80,30 +59,50 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         self.rcpttos = []
         self.received_data = b''
         self.state = 'COMMAND'
+        self.connected = True
         super().__init__(request, client_address, server)
 
     def setup(self):
         try:
-            self.request.sendall(b'220 %s ESMTP Email Daemon ready\r\n' % socket.getfqdn().encode())
+            # Send immediate SMTP greeting
+            greeting = '220 %s ESMTP Email Daemon ready\r\n' % socket.getfqdn()
+            self.request.sendall(greeting.encode())
+            logger.info(f"SMTP greeting sent to client")
         except Exception as e:
             logger.error(f"Error sending greeting: {e}")
+            self.connected = False
 
     def handle(self):
-        while True:
+        if not self.connected:
+            return
+            
+        while self.connected:
             try:
+                # Set timeout to prevent hanging
+                self.request.settimeout(10.0)
+                
                 data = self.request.recv(1024)
                 if not data:
+                    logger.info("Client disconnected")
                     break
                     
                 self.received_data += data
-                if b'\r\n' in self.received_data:
-                    lines = self.received_data.split(b'\r\n')
-                    for line in lines[:-1]:
-                        if line:  # Skip empty lines
-                            self.process_line(line.decode('utf-8').strip())
-                    self.received_data = lines[-1]
+                
+                # Process complete lines only
+                while b'\r\n' in self.received_data:
+                    line_end = self.received_data.find(b'\r\n')
+                    line = self.received_data[:line_end].decode('utf-8', errors='ignore').strip()
+                    self.received_data = self.received_data[line_end + 2:]
                     
-            except (ConnectionResetError, BrokenPipeError, socket.timeout):
+                    if line:
+                        logger.debug(f"Received command: {line}")
+                        self.process_line(line)
+                    
+            except socket.timeout:
+                logger.warning("Socket timeout, closing connection")
+                break
+            except (ConnectionResetError, BrokenPipeError):
+                logger.info("Client connection reset")
                 break
             except Exception as e:
                 logger.error(f"Error handling request: {e}")
@@ -130,24 +129,30 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
                 
             method = getattr(self, method_name)
             method(arg)
+            
         elif self.state == 'DATA':
             if line == '.':
                 self.smtp_DATA_end()
             else:
+                # Remove transparency dot if present
                 if line.startswith('..'):
                     line = line[1:]
                 self.data += line + '\r\n'
 
     def send_response(self, response):
         try:
+            logger.debug(f"Sending response: {response}")
             self.request.sendall(response.encode() + b'\r\n')
         except Exception as e:
             logger.error(f"Error sending response: {e}")
+            self.connected = False
 
     def smtp_EHLO(self, arg):
         if not arg:
             self.send_response('501 Syntax: EHLO hostname')
             return
+            
+        # Handle HAProxy health checks specifically
         self.send_response('250-%s' % socket.getfqdn())
         self.send_response('250-8BITMIME')
         self.send_response('250-PIPELINING')
@@ -169,6 +174,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             self.request.close()
         except:
             pass
+        self.connected = False
         
     def smtp_MAIL(self, arg):
         if not arg or not arg.upper().startswith('FROM:'):
@@ -221,6 +227,23 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         self.send_response('354 End data with <CR><LF>.<CR><LF>')
         self.state = 'DATA'
         
+    # Add missing SMTP commands that HAProxy might send
+    def smtp_STARTTLS(self, arg):
+        """Handle STARTTLS command"""
+        self.send_response('454 TLS not available')
+        
+    def smtp_VRFY(self, arg):
+        """Handle VRFY command"""
+        self.send_response('252 Cannot verify user')
+        
+    def smtp_EXPN(self, arg):
+        """Handle EXPN command"""
+        self.send_response('502 EXPN not implemented')
+        
+    def smtp_HELP(self, arg):
+        """Handle HELP command"""
+        self.send_response('214 Supported commands: EHLO, HELO, MAIL, RCPT, DATA, RSET, NOOP, QUIT')
+        
     def smtp_DATA_end(self):
         try:
             msg = BytesParser(policy=policy.default).parsebytes(self.data.encode())
@@ -264,40 +287,11 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
 class HAProxySMTPServer:
     """SMTP server for HAProxy connections using modern socketserver"""
     
-    def __init__(self, host, port, processor, use_ssl=True):  # Changed to True by default
+    def __init__(self, host, port, processor):
         self.processor = processor
         self.host = host
         self.port = port
-        self.use_ssl = use_ssl
         self.server = None
-        self.ssl_context = None
-        
-        self.setup_ssl_context()  # Always setup SSL context
-        
-    def setup_ssl_context(self):
-        """Setup SSL context for secure connections"""
-        try:
-            self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-            # Load your SSL certificates
-            self.ssl_context.load_cert_chain(
-                certfile='/etc/ssl/default/fullchain.pem',
-                keyfile='/etc/ssl/default/ssl.key'
-            )
-            # Use more compatible cipher settings
-            self.ssl_context.set_ciphers('HIGH:!aNULL:!MD5:!RC4:!3DES')
-            self.ssl_context.check_hostname = False
-            self.ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # Set shorter timeouts for better HAProxy compatibility
-            self.ssl_context.options |= ssl.OP_NO_TICKET
-            logger.info("SSL context configured successfully for HAProxy")
-            
-        except Exception as e:
-            logger.error(f"Failed to setup SSL context: {e}")
-            # Don't disable SSL entirely, just continue without specific context
-            self.ssl_context = ssl.create_default_context()
-            self.ssl_context.check_hostname = False
-            self.ssl_context.verify_mode = ssl.CERT_NONE
         
     def start(self):
         """Start the SMTP server"""
@@ -309,9 +303,9 @@ class HAProxySMTPServer:
                 return SMTPRequestHandler(*args)
         
         # Create server with processor reference
-        class CustomServer(SSLThreadedTCPServer):
-            def __init__(self, server_address, handler_class, processor, ssl_context=None):
-                super().__init__(server_address, handler_class, processor, ssl_context)
+        class CustomServer(ThreadedTCPServer):
+            def __init__(self, server_address, handler_class, processor):
+                super().__init__(server_address, handler_class, processor)
                 self.processor = processor
         
         handler_factory = HandlerFactory(self.processor)
@@ -320,14 +314,13 @@ class HAProxySMTPServer:
             self.server = CustomServer(
                 (self.host, self.port), 
                 handler_factory, 
-                self.processor,
-                self.ssl_context if self.use_ssl else None
+                self.processor
             )
             
             # Set socket timeout to prevent hanging
             self.server.socket.settimeout(30)
             
-            logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port} {'(SSL)' if self.use_ssl else ''}")
+            logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port}")
             
             # Start server in a separate thread
             self.server_thread = threading.Thread(target=self.server.serve_forever)
@@ -398,7 +391,7 @@ class EmailValidator:
     @staticmethod
     def validate_email_format(email_address):
         """Validate email format using RFC 5322 compliant regex"""
-        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        pattern = r'^[a-zA-Z00-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(pattern, email_address) is not None
 
     @staticmethod
@@ -644,7 +637,7 @@ class EmailQueueProcessor:
         self.queue_thread.daemon = True
         self.queue_thread.start()
         
-        # Start HAProxy SMTP server
+        # Start HAProxy SMTP server (without SSL)
         self.haproxy_server = HAProxySMTPServer('0.0.0.0', 3000, self)
         self.haproxy_server.start()
         
