@@ -265,6 +265,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         if addr.startswith('<') and addr.endswith('>'):
             addr = addr[1:-1]
         if not EmailValidator.validate_email_format(addr):
+            logger.error(f"address validation failed: {addr}")
             self.send_response('553 5.1.7 Invalid sender address')
             return
         self.mailfrom = addr
