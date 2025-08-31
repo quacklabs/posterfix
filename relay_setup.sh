@@ -6,6 +6,7 @@ MASTER=""
 SCP_PASSWORD="Exc@libur"
 PROJECT_DIR="/opt/email_daemon"
 SERVICE_USER="emaildaemon"
+VENV_DIR="$PROJECT_DIR/venv"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -31,7 +32,7 @@ sudo apt-get update -y
 sudo apt-get upgrade -y
 
 # Install Python and pip if not already installed
-sudo apt-get install -y python3 python3-pip python3-venv
+sudo apt-get install -y python3 python3-pip python3-venv python3-full
 
 # Create project directory
 echo "Creating project directory..."
@@ -42,10 +43,16 @@ sudo chown $USER:$USER $PROJECT_DIR
 echo "Copying project files..."
 cp -r ./* $PROJECT_DIR/
 
-# Install required Python packages
+# Create virtual environment
+echo "Creating Python virtual environment..."
+python3 -m venv $VENV_DIR
+
+# Install required Python packages in the virtual environment
 echo "Installing Python dependencies..."
-cd $PROJECT_DIR
-pip3 install -r requirements.txt
+source $VENV_DIR/bin/activate
+pip install --upgrade pip
+pip install -r $PROJECT_DIR/requirements.txt
+deactivate
 
 # Step 2: Setup Redis (optional, if you're using Redis for queuing)
 echo "Setting up Redis..."
@@ -59,7 +66,7 @@ sudo useradd -r -s /usr/sbin/nologin -d $PROJECT_DIR $SERVICE_USER 2>/dev/null |
 
 # Step 4: Configure DKIM and SSL keys
 echo "Setting up DKIM and SSL keys..."
-mkdir -p $KEYS_DIR
+sudo mkdir -p $KEYS_DIR
 
 # Install sshpass for password-based SCP
 sudo apt-get install -y sshpass
@@ -106,7 +113,8 @@ Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
 WorkingDirectory=$PROJECT_DIR
-ExecStart=/usr/bin/python3 $PROJECT_DIR/email_daemon.py
+Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=$VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py
 Restart=always
 RestartSec=5s
 Environment=PYTHONUNBUFFERED=1
@@ -142,7 +150,9 @@ if ! systemctl is-active --quiet email_daemon.service; then
   echo "Service failed to start. Checking logs..."
   sudo journalctl -u email_daemon.service -b --no-pager -n 20
   echo "Trying to run the script manually to debug..."
-  sudo -u $SERVICE_USER python3 $PROJECT_DIR/email_daemon.py --debug
+  sudo -u $SERVICE_USER $VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py --debug
 fi
 
 echo "Setup complete! Check the status above to ensure your Email Daemon is running."
+echo "Virtual environment location: $VENV_DIR"
+echo "Project directory: $PROJECT_DIR"
