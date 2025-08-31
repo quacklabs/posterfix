@@ -51,11 +51,51 @@ python3 -m venv $VENV_DIR
 echo "Installing Python dependencies..."
 source $VENV_DIR/bin/activate
 pip install --upgrade pip
-pip install -r $PROJECT_DIR/requirements.txt
+
+# Check if requirements.txt exists and fix version issues
+if [ -f "$PROJECT_DIR/requirements.txt" ]; then
+    echo "Checking requirements.txt for version issues..."
+    
+    # Create a temporary fixed requirements file
+    FIXED_REQUIREMENTS="$PROJECT_DIR/requirements_fixed.txt"
+    
+    # Process each line in requirements.txt
+    while IFS= read -r line; do
+        if [[ "$line" == *"dkimpy==1.2.2"* ]]; then
+            echo "Fixing dkimpy version from 1.2.2 to latest available..."
+            echo "dkimpy>=1.1.8" >> "$FIXED_REQUIREMENTS"
+        else
+            echo "$line" >> "$FIXED_REQUIREMENTS"
+        fi
+    done < "$PROJECT_DIR/requirements.txt"
+    
+    echo "Installing from fixed requirements file..."
+    pip install -r "$FIXED_REQUIREMENTS"
+else
+    echo "requirements.txt not found. Installing common email packages..."
+    pip install redis aiosmtplib email-validator dkimpy>=1.1.8
+fi
+
+# Install essential packages that might be missing
+echo "Installing essential email packages..."
+pip install redis>=4.5.0 dkimpy>=1.1.8 aiosmtplib>=2.0.0 email-validator>=1.3.0
+
+# Verify critical modules are installed
+echo "Verifying module installations..."
+python -c "import redis; print('Redis module successfully imported')" || {
+    echo "Installing redis..."
+    pip install redis
+}
+
+python -c "import dkim; print('DKIM module successfully imported')" || {
+    echo "Installing dkimpy..."
+    pip install dkimpy
+}
+
 deactivate
 
-# Step 2: Setup Redis (optional, if you're using Redis for queuing)
-echo "Setting up Redis..."
+# Step 2: Setup Redis server
+echo "Setting up Redis server..."
 sudo apt-get install -y redis-server
 sudo systemctl enable redis-server
 sudo systemctl start redis-server
@@ -133,24 +173,35 @@ EOL
 # Reload systemd to apply the new service
 sudo systemctl daemon-reload
 
-# Step 7: Enable and start the service
+# Step 7: Test the virtual environment manually
+echo "Testing virtual environment setup..."
+sudo -u $SERVICE_USER $VENV_DIR/bin/python -c "import redis; print('Redis import successful')"
+sudo -u $SERVICE_USER $VENV_DIR/bin/python -c "import dkim; print('DKIM import successful')"
+sudo -u $SERVICE_USER $VENV_DIR/bin/python -c "import sys; print('Python path:', sys.path)"
+
+# Step 8: Enable and start the service
 echo "Enabling and starting the Email Daemon service..."
 sudo systemctl enable email_daemon.service
 sudo systemctl start email_daemon.service
 
 # Wait a moment for service to start
-sleep 3
+sleep 5
 
-# Step 8: Check the status of the service
+# Step 9: Check the status of the service
 echo "Checking the status of the Email Daemon..."
 sudo systemctl status email_daemon.service
 
-# Step 9: Show logs if service failed
+# Step 10: Show logs if service failed
 if ! systemctl is-active --quiet email_daemon.service; then
   echo "Service failed to start. Checking logs..."
   sudo journalctl -u email_daemon.service -b --no-pager -n 20
-  echo "Trying to run the script manually to debug..."
-  sudo -u $SERVICE_USER $VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py --debug
+  
+  echo "Testing the script manually with the service user..."
+  sudo -u $SERVICE_USER $VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py --help || \
+  sudo -u $SERVICE_USER $VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py
+  
+  echo "Checking virtual environment contents..."
+  sudo -u $SERVICE_USER $VENV_DIR/bin/pip list
 fi
 
 echo "Setup complete! Check the status above to ensure your Email Daemon is running."
