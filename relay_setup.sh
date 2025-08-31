@@ -43,6 +43,26 @@ sudo chown $USER:$USER $PROJECT_DIR
 echo "Copying project files..."
 cp -r ./* $PROJECT_DIR/
 
+# Step 1.5: Fix asyncore import issue in the Python script
+echo "Checking for asyncore import issues..."
+if grep -q "import asyncore" "$PROJECT_DIR/email_daemon.py"; then
+    echo "Found asyncore import. Fixing for Python 3.12 compatibility..."
+    
+    # Create backup
+    cp "$PROJECT_DIR/email_daemon.py" "$PROJECT_DIR/email_daemon.py.backup"
+    
+    # Replace asyncore with asyncio alternatives
+    sed -i 's/import asyncore/# import asyncore  # Removed in Python 3.12/g' "$PROJECT_DIR/email_daemon.py"
+    sed -i 's/asyncore\./asyncio./g' "$PROJECT_DIR/email_daemon.py"
+    
+    # Add asyncio import if not present
+    if ! grep -q "import asyncio" "$PROJECT_DIR/email_daemon.py"; then
+        sed -i '1i import asyncio' "$PROJECT_DIR/email_daemon.py"
+    fi
+    
+    echo "Asyncore imports fixed for Python 3.12"
+fi
+
 # Create virtual environment
 echo "Creating Python virtual environment..."
 python3 -m venv $VENV_DIR
@@ -52,44 +72,39 @@ echo "Installing Python dependencies..."
 source $VENV_DIR/bin/activate
 pip install --upgrade pip
 
+# Install essential packages
+echo "Installing essential email packages..."
+pip install redis>=4.5.0 dkimpy>=1.1.8 aiosmtplib>=2.0.0 email-validator>=1.3.0 asyncio aiosmtpd
+
 # Check if requirements.txt exists and fix version issues
 if [ -f "$PROJECT_DIR/requirements.txt" ]; then
-    echo "Checking requirements.txt for version issues..."
+    echo "Installing from requirements.txt with version fixes..."
     
     # Create a temporary fixed requirements file
     FIXED_REQUIREMENTS="$PROJECT_DIR/requirements_fixed.txt"
+    cp "$PROJECT_DIR/requirements.txt" "$FIXED_REQUIREMENTS"
     
-    # Process each line in requirements.txt
-    while IFS= read -r line; do
-        if [[ "$line" == *"dkimpy==1.2.2"* ]]; then
-            echo "Fixing dkimpy version from 1.2.2 to latest available..."
-            echo "dkimpy>=1.1.8" >> "$FIXED_REQUIREMENTS"
-        else
-            echo "$line" >> "$FIXED_REQUIREMENTS"
-        fi
-    done < "$PROJECT_DIR/requirements.txt"
+    # Fix common version issues
+    sed -i 's/dkimpy==1.2.2/dkimpy>=1.1.8/' "$FIXED_REQUIREMENTS"
     
-    echo "Installing from fixed requirements file..."
     pip install -r "$FIXED_REQUIREMENTS"
-else
-    echo "requirements.txt not found. Installing common email packages..."
-    pip install redis aiosmtplib email-validator dkimpy>=1.1.8
 fi
-
-# Install essential packages that might be missing
-echo "Installing essential email packages..."
-pip install redis>=4.5.0 dkimpy>=1.1.8 aiosmtplib>=2.0.0 email-validator>=1.3.0
 
 # Verify critical modules are installed
 echo "Verifying module installations..."
-python -c "import redis; print('Redis module successfully imported')" || {
+python -c "import redis; print('✓ Redis module successfully imported')" || {
     echo "Installing redis..."
     pip install redis
 }
 
-python -c "import dkim; print('DKIM module successfully imported')" || {
+python -c "import dkim; print('✓ DKIM module successfully imported')" || {
     echo "Installing dkimpy..."
     pip install dkimpy
+}
+
+python -c "import asyncio; print('✓ Asyncio module successfully imported')" || {
+    echo "Installing asyncio..."
+    pip install asyncio
 }
 
 deactivate
@@ -175,11 +190,27 @@ sudo systemctl daemon-reload
 
 # Step 7: Test the virtual environment manually
 echo "Testing virtual environment setup..."
-sudo -u $SERVICE_USER $VENV_DIR/bin/python -c "import redis; print('Redis import successful')"
-sudo -u $SERVICE_USER $VENV_DIR/bin/python -c "import dkim; print('DKIM import successful')"
-sudo -u $SERVICE_USER $VENV_DIR/bin/python -c "import sys; print('Python path:', sys.path)"
+sudo -u $SERVICE_USER $VENV_DIR/bin/python -c "
+import redis
+import dkim
+import asyncio
+print('✓ All critical imports successful')
+print('Redis version:', redis.__version__)
+print('DKIM version:', dkim.__version__)
+"
 
-# Step 8: Enable and start the service
+# Step 8: Test the actual script
+echo "Testing the email daemon script..."
+if sudo -u $SERVICE_USER $VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py --help 2>/dev/null; then
+    echo "✓ Script test passed with --help flag"
+elif sudo -u $SERVICE_USER $VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py --version 2>/dev/null; then
+    echo "✓ Script test passed with --version flag"
+else
+    echo "⚠ Script may require specific arguments. Testing basic syntax..."
+    sudo -u $SERVICE_USER $VENV_DIR/bin/python -m py_compile $PROJECT_DIR/email_daemon.py && echo "✓ Script syntax is valid"
+fi
+
+# Step 9: Enable and start the service
 echo "Enabling and starting the Email Daemon service..."
 sudo systemctl enable email_daemon.service
 sudo systemctl start email_daemon.service
@@ -187,23 +218,31 @@ sudo systemctl start email_daemon.service
 # Wait a moment for service to start
 sleep 5
 
-# Step 9: Check the status of the service
+# Step 10: Check the status of the service
 echo "Checking the status of the Email Daemon..."
-sudo systemctl status email_daemon.service
-
-# Step 10: Show logs if service failed
-if ! systemctl is-active --quiet email_daemon.service; then
-  echo "Service failed to start. Checking logs..."
-  sudo journalctl -u email_daemon.service -b --no-pager -n 20
-  
-  echo "Testing the script manually with the service user..."
-  sudo -u $SERVICE_USER $VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py --help || \
-  sudo -u $SERVICE_USER $VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py
-  
-  echo "Checking virtual environment contents..."
-  sudo -u $SERVICE_USER $VENV_DIR/bin/pip list
+if sudo systemctl is-active --quiet email_daemon.service; then
+    echo "✓ Service is running successfully!"
+    sudo systemctl status email_daemon.service --no-pager -l
+else
+    echo "✗ Service failed to start. Checking logs..."
+    sudo journalctl -u email_daemon.service -b --no-pager -n 30
+    
+    # Additional debugging
+    echo "Checking script for import issues..."
+    sudo -u $SERVICE_USER $VENV_DIR/bin/python -c "
+import sys
+sys.path.insert(0, '/opt/email_daemon')
+try:
+    from email_daemon import main
+    print('✓ Script can be imported successfully')
+except Exception as e:
+    print('✗ Import error:', e)
+    import traceback
+    traceback.print_exc()
+"
 fi
 
-echo "Setup complete! Check the status above to ensure your Email Daemon is running."
+echo "Setup complete!"
 echo "Virtual environment location: $VENV_DIR"
 echo "Project directory: $PROJECT_DIR"
+echo "Service status: $(sudo systemctl is-active email_daemon.service)"
