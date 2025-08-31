@@ -280,6 +280,7 @@ fi
 #Setup firewall
 ufw enable
 ufw allow from $MASTER to any port 3000
+ufw allow 587
 
 echo "Setup complete!"
 echo "Virtual environment location: $VENV_DIR"
