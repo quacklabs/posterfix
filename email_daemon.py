@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Email Daemon - Plain SMTP inbound, DKIM signing outbound, direct MX relay
-- No HAProxy health-check special cases
-- No inbound SSL/TLS or STARTTLS; pure plaintext SMTP listener
-- Outbound SMTP may use STARTTLS/SSL when talking to remote MX
-- Robust MAIL/RCPT parsing using parseaddr; strips ESMTP params (SIZE=..., ORCPT=..., etc.)
-- If a PROXY protocol header is present as the first line, it will be ignored.
+Cleaned Email Daemon - Plain SMTP inbound, DKIM signing outbound, direct MX relay.
+- No HAProxy/health-check special-case logging.
+- Only logs real SMTP actions: EHLO/HELO, MAIL FROM, RCPT TO, DATA start/end, QUIT and errors.
+- Robust MAIL/RCPT parsing using email.utils.parseaddr; trims ESMTP params (SIZE=..., ORCPT=..., etc.)
+- DKIM signing for outbound (if private key available).
 """
 import time
 import logging
@@ -18,7 +17,6 @@ import json
 import queue
 import socketserver
 import threading
-import email
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr, formatdate, make_msgid
@@ -38,11 +36,6 @@ REDIS_CONFIG = {
 DEFAULT_RATE_LIMIT = 1000
 RATE_LIMIT = 500
 
-SPAM_WORDS = [
-    'viagra', 'casino', 'lottery', 'prize', 'winner', 'free', 'money',
-    'credit', 'loan', 'mortgage', 'drug', 'pharmacy', 'prescription'
-]
-
 BANNED_TLDS = [
     '.xyz', '.top', '.club', '.info', '.bid', '.win', '.loan', '.work'
 ]
@@ -61,14 +54,15 @@ QUEUE_KEY = 'email_queue'
 # ==================== LOGGING SETUP ====================
 os.makedirs(LOG_DIR, exist_ok=True)
 logger = logging.getLogger('EmailDaemon')
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)  # only log INFO+ (actual SMTP actions & errors)
 
+# Remove existing handlers
 for h in logger.handlers[:]:
     logger.removeHandler(h)
 
 file_handler = logging.FileHandler(f'{LOG_DIR}/email_daemon.log')
 stream_handler = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
@@ -147,20 +141,14 @@ class TLSManager:
             return f.read()
 
     def sign_raw_message(self, raw_bytes: bytes, mail_from: str) -> bytes:
-        # If we don't have a key, return raw message unchanged
         if not self.private_key:
             return raw_bytes
-
-        # derive signing domain from envelope sender
         try:
             domain = (mail_from.split('@', 1)[1]).lower()
         except Exception:
-            # Can't determine domain -> skip signing
             return raw_bytes
-
         selector = DKIM_SELECTOR.encode()
         d = domain.encode()
-        # include common headers
         headers = [b'from', b'to', b'subject', b'date', b'message-id']
         try:
             sig = dkim.sign(
@@ -170,7 +158,6 @@ class TLSManager:
                 privkey=self.private_key,
                 include_headers=headers,
             )
-            # dkim.sign returns a b"DKIM-Signature: ..." header line + CRLF
             return sig + raw_bytes
         except Exception as e:
             logger.warning(f"DKIM signing failed: {e}")
@@ -179,11 +166,7 @@ class TLSManager:
 # ==================== SMTP SERVER (INBOUND) ====================
 class SMTPRequestHandler(socketserver.BaseRequestHandler):
     """
-    Plain SMTP handler:
-    - Greets client immediately
-    - Accepts commands EHLO/HELO/MAIL/RCPT/DATA/RSET/NOOP/QUIT/HELP
-    - Robust MAIL/RCPT parsing using parseaddr; trims parameters like SIZE=...
-    - Ignores a leading PROXY protocol line if present
+    Plain SMTP handler — minimal, logs only SMTP actions.
     """
 
     def __init__(self, request, client_address, server):
@@ -197,12 +180,9 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
 
     def setup(self):
         try:
-            greeting = f'220 {socket.gethostname()} ESMTP Email Daemon ready\r\n'
+            greeting = f'220 {socket.gethostname()} ESMTP ready\r\n'
             self.request.sendall(greeting.encode())
-            logger.info(f"🔄 NEW CONNECTION from {self.client_address[0]}:{self.client_address[1]}")
-            logger.info(f"📤 Sent: 220 ESMTP ready")
-        except Exception as e:
-            logger.error(f"Setup error: {e}")
+        except Exception:
             self.connected = False
 
     def handle(self):
@@ -214,7 +194,6 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
                 self.request.settimeout(60.0)
                 data = self.request.recv(4096)
                 if not data:
-                    logger.info("Client disconnected")
                     break
                 buffer += data
                 while b'\r\n' in buffer:
@@ -225,38 +204,28 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
                         line = raw_line.decode('utf-8', errors='ignore')
                     except Exception:
                         line = raw_line.decode('latin-1', errors='ignore')
-                    logger.debug(f"📥 Received: {line}")
                     self.process_smtp_command(line)
             except socket.timeout:
-                logger.warning("Socket timeout, closing connection")
                 break
             except (ConnectionResetError, BrokenPipeError):
-                logger.info("Connection reset by peer")
                 break
-            except Exception as e:
-                logger.error(f"Handle error: {e}")
+            except Exception:
                 break
 
     def process_smtp_command(self, line: str):
-        """
-        High level dispatcher. Ignores PROXY header lines if they appear.
-        """
         if not line:
             return
 
-        # If HAProxy was configured with send-proxy, we may receive a PROXY header first.
-        # Ignore it so we don't treat it as an SMTP command.
+        # If the first line is a PROXY header (HAProxy send-proxy), ignore it silently.
         if line.startswith('PROXY '):
-            logger.debug("Ignored PROXY protocol header")
             return
 
         if self.state == 'COMMAND':
             self.process_smtp_command_state(line)
-        elif self.state == 'DATA':
+        else:
             self.process_data_line(line)
 
     def process_smtp_command_state(self, line: str):
-        # split into command and rest (arg)
         i = line.find(' ')
         if i < 0:
             command = line.upper()
@@ -266,15 +235,15 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             arg = line[i+1:].strip()
         method_name = 'smtp_' + command
         if not hasattr(self, method_name):
-            self.send_response(f'502 5.5.2 Error: command "{command}" not implemented')
+            self.send_response('502 5.5.2 Error: command not implemented')
             return
         getattr(self, method_name)(arg)
 
     def process_data_line(self, line: str):
         if line == '.':
+            # end of DATA
             self.smtp_DATA_end()
         else:
-            # dot-stuffing support
             if line.startswith('..'):
                 line = line[1:]
             self.data_lines.append(line)
@@ -282,12 +251,10 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
     def send_response(self, response: str):
         try:
             self.request.sendall((response + '\r\n').encode())
-            logger.info(f"📤 Sent: {response}")
-        except Exception as e:
-            logger.error(f"Send error: {e}")
+        except Exception:
             self.connected = False
 
-    # SMTP command handlers
+    # --- SMTP commands (only log actual actions) ---
     def smtp_EHLO(self, arg):
         if not arg:
             self.send_response('501 5.5.4 Syntax: EHLO hostname')
@@ -297,110 +264,82 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         self.send_response('250-PIPELINING')
         self.send_response('250-SIZE 10485760')
         self.send_response('250 HELP')
+        logger.info(f"EHLO {arg}")
 
     def smtp_HELO(self, arg):
         if not arg:
             self.send_response('501 5.5.4 Syntax: HELO hostname')
             return
         self.send_response(f'250 {socket.gethostname()}')
+        logger.info(f"HELO {arg}")
 
     def smtp_NOOP(self, arg):
         self.send_response('250 2.0.0 OK')
 
     def smtp_QUIT(self, arg):
         self.send_response('221 2.0.0 Bye')
+        logger.info("QUIT")
         self.connected = False
 
     def smtp_MAIL(self, arg):
-        """
-        Robust MAIL FROM parser:
-        - Accepts: MAIL FROM:<user@example.com> SIZE=nnn
-        - Accepts null sender: MAIL FROM:<>
-        - Uses email.utils.parseaddr to extract address safely
-        """
         if not arg:
             self.send_response("501 5.5.4 Syntax: MAIL FROM:<address>")
             return
 
-        # some clients send 'FROM:<addr> PARAM=...' ; others may include multiple spaces
-        # extract text after the first ':' if present
-        try:
-            # accept forms like 'FROM:<a@b>' or 'FROM: <a@b>'
-            if ':' in arg:
-                raw = arg.split(':', 1)[1].strip()
-            else:
-                raw = arg.strip()
-        except Exception:
+        # extract after first ':' if present
+        if ':' in arg:
+            raw = arg.split(':', 1)[1].strip()
+        else:
             raw = arg.strip()
 
-        # split off any ESMTP parameters (SIZE=, BODY=, etc.)
+        # token = first whitespace-separated token (drop params like SIZE=)
         token = raw.split(None, 1)[0] if raw else ''
 
-        # handle null sender explicitly
+        # null sender
         if token == '<>' or token == '':
             self.mailfrom = ''
             self.send_response('250 2.1.0 OK')
+            logger.info("MAIL FROM: <> (null sender)")
             return
 
-        # parseaddr handles angle brackets and quotes
-        name, addr = parseaddr(token)
+        # use parseaddr to get bare address
+        _, addr = parseaddr(token)
         addr = addr.strip()
 
-        if not addr:
+        if not addr or not EmailValidator.validate_email_format(addr):
             self.send_response("553 5.1.7 Invalid sender address")
+            logger.info(f"MAIL FROM rejected: {token}")
             return
 
-        if not EmailValidator.validate_email_format(addr):
-            self.send_response("553 5.1.7 Invalid sender address")
-            return
-
-        # store bare envelope sender
         self.mailfrom = addr
-        logger.info(f"Envelope MAIL FROM set to: {self.mailfrom}")
         self.send_response("250 2.1.0 OK")
+        logger.info(f"MAIL FROM: {self.mailfrom}")
 
     def smtp_RCPT(self, arg):
-        """
-        Robust RCPT TO parser:
-        - Accepts: RCPT TO:<user@domain> ORCPT=rfc822;...
-        - Uses parseaddr and trims parameters
-        """
-        # mailfrom may be empty string for null sender (that's allowed)
         if self.mailfrom is None:
             self.send_response('503 5.5.1 Need MAIL before RCPT')
             return
-
         if not arg:
             self.send_response('501 5.5.4 Syntax: RCPT TO:<address>')
             return
 
-        try:
-            if ':' in arg:
-                raw = arg.split(':', 1)[1].strip()
-            else:
-                raw = arg.strip()
-        except Exception:
+        if ':' in arg:
+            raw = arg.split(':', 1)[1].strip()
+        else:
             raw = arg.strip()
 
         token = raw.split(None, 1)[0] if raw else ''
-
-        # parseaddr will strip <> and quotes
-        name, addr = parseaddr(token)
+        _, addr = parseaddr(token)
         addr = addr.strip()
 
-        if not addr:
+        if not addr or not EmailValidator.validate_email_format(addr):
             self.send_response('553 5.1.7 Invalid recipient address')
+            logger.info(f"RCPT TO rejected: {token}")
             return
 
-        # basic format validation
-        if not EmailValidator.validate_email_format(addr):
-            self.send_response('553 5.1.7 Invalid recipient address')
-            return
-
-        # append to recipients
         self.rcpttos.append(addr)
-        logger.info(f"Added RCPT TO: {addr}")
         self.send_response('250 2.1.5 OK')
+        logger.info(f"RCPT TO: {addr}")
 
     def smtp_RSET(self, arg):
         self.mailfrom = None
@@ -408,6 +347,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         self.data_lines = []
         self.state = 'COMMAND'
         self.send_response('250 2.0.0 OK')
+        logger.info("RSET")
 
     def smtp_DATA(self, arg):
         if not self.rcpttos:
@@ -415,24 +355,20 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             return
         self.send_response('354 3.0.0 End data with <CR><LF>.<CR><LF>')
         self.state = 'DATA'
+        logger.info("DATA start")
 
     def smtp_STARTTLS(self, arg):
-        # Not supported for inbound in this daemon
         self.send_response('454 4.7.0 TLS not available')
 
     def smtp_HELP(self, arg):
         self.send_response('214 2.0.0 Supported: EHLO, HELO, MAIL, RCPT, DATA, RSET, NOOP, QUIT')
 
     def smtp_DATA_end(self):
-        """
-        Called once a \".\" line is received while in DATA state.
-        Assembles the message, ensures minimal headers exist, queues for outbound delivery.
-        """
         try:
             raw_body = '\r\n'.join(self.data_lines) + '\r\n'
             msg_bytes = raw_body.encode('utf-8', errors='replace')
 
-            # Parse message (may be just body or full message with headers)
+            # attempt to parse headers; if missing, add minimal headers
             try:
                 parsed = BytesParser(policy=policy.default).parsebytes(msg_bytes)
             except Exception:
@@ -450,18 +386,18 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
                 prefix = (''.join(headers_to_add)).encode()
                 msg_bytes = prefix + msg_bytes
 
-            # Queue full raw message (string in redis) for delivery
+            # enqueue for delivery
             self.processor.add_to_queue(
                 mail_from=self.mailfrom if self.mailfrom is not None else '',
                 rcpt_to=list(self.rcpttos),
                 raw_message=msg_bytes,
             )
             self.send_response('250 2.0.0 OK: Message queued for delivery')
+            logger.info(f"Queued message from={self.mailfrom} to={len(self.rcpttos)} recipient(s)")
         except Exception as e:
-            logger.error(f"DATA processing error: {e}")
             self.send_response('451 4.3.0 Error: Failed to process message')
+            logger.error(f"DATA processing error: {e}")
         finally:
-            # reset state
             self.data_lines = []
             self.state = 'COMMAND'
             self.mailfrom = None
@@ -490,7 +426,6 @@ class EmailQueueProcessor:
         self.tls_manager = TLSManager()
         self.server = None
 
-    # --- Queue API ---
     def add_to_queue(self, mail_from: str, rcpt_to: list, raw_message: bytes):
         item = {
             'mail_from': mail_from,
@@ -503,7 +438,6 @@ class EmailQueueProcessor:
         except Exception as e:
             logger.error(f"Redis enqueue failed: {e}")
         self.local_queue.put(item)
-        logger.info(f"Queued message to {len(rcpt_to)} recipient(s)")
 
     def process_queue(self):
         while self.running:
@@ -520,61 +454,54 @@ class EmailQueueProcessor:
                 rcpt_to = item.get('rcpt_to', [])
                 raw_message = item.get('raw_message', '').encode('utf-8', errors='replace')
 
-                # DKIM sign (if key available)
                 signed_bytes = self.tls_manager.sign_raw_message(raw_message, mail_from)
 
-                # Group recipients by domain and validate
                 grouped = defaultdict(list)
                 for addr in rcpt_to:
                     try:
                         domain = addr.split('@', 1)[1].lower()
                         if EmailValidator.is_banned_tld(domain) or EmailValidator.is_blocklisted_domain(domain):
-                            logger.warning(f"Blocked recipient domain: {domain}")
+                            logger.info(f"Blocked recipient domain: {domain}")
                             continue
                         grouped[domain].append(addr)
                     except Exception:
-                        logger.warning(f"Invalid recipient: {addr}")
+                        logger.info(f"Invalid recipient skipped: {addr}")
 
                 succ_total, fail_total = 0, 0
                 for domain, recipients in grouped.items():
                     mx_list = self.get_mx_servers(domain)
                     if not mx_list:
-                        logger.error(f"No MX for {domain}")
                         fail_total += len(recipients)
                         continue
                     sent, failed = self.send_via_mx_list(mail_from, recipients, signed_bytes, mx_list)
                     succ_total += len(sent)
                     fail_total += len(failed)
 
-                logger.info(f"Delivery result: {succ_total} sent, {fail_total} failed")
+                if succ_total or fail_total:
+                    logger.info(f"Delivery result: {succ_total} sent, {fail_total} failed")
             except Exception as e:
                 logger.error(f"Queue error: {e}")
                 time.sleep(2)
 
-    # --- MX discovery ---
     def ping_mx_server(self, host, port):
         try:
             with socket.create_connection((host, port), timeout=10) as s:
-                s.settimeout(10)
-                # Read banner first
-                banner = b''
+                s.settimeout(5)
                 try:
                     banner = s.recv(1024)
                 except Exception:
-                    pass
+                    banner = b''
                 return banner.startswith(b'220')
         except Exception:
             return False
 
     def get_mx_servers(self, domain):
-        # cached for 1 hour
         if domain in self._mx_cache and (time.time() - self._mx_cache[domain]['ts']) < 3600:
             return self._mx_cache[domain]['list']
         try:
             answers = dns.resolver.resolve(domain, 'MX')
             mx_records = sorted([(r.preference, str(r.exchange).rstrip('.')) for r in answers])
-        except Exception as e:
-            logger.error(f"DNS MX lookup failed for {domain}: {e}")
+        except Exception:
             mx_records = []
         candidates = []
         valid_ports = [25, 587, 465, 2525]
@@ -585,7 +512,6 @@ class EmailQueueProcessor:
         self._mx_cache[domain] = {'ts': time.time(), 'list': candidates}
         return candidates
 
-    # --- Outbound send ---
     def send_via_mx_list(self, mail_from, recipients, msg_bytes, mx_list):
         successful, failed = [], []
         for mx in mx_list:
@@ -596,9 +522,9 @@ class EmailQueueProcessor:
                 successful.extend(sent)
                 failed.extend(failed_local)
                 if sent:
-                    break  # stop if some recipients accepted by this MX
+                    break
             except Exception as e:
-                logger.warning(f"MX {mx.host}:{mx.port} failed: {e}")
+                logger.info(f"MX {mx.host}:{mx.port} failed: {e}")
                 continue
         return successful, failed
 
@@ -611,7 +537,6 @@ class EmailQueueProcessor:
             else:
                 server = smtplib.SMTP(mx.host, mx.port, timeout=20)
                 server.ehlo_or_helo_if_needed()
-                # Try STARTTLS if offered
                 try:
                     if 'starttls' in server.esmtp_features:
                         server.starttls(context=ssl.create_default_context())
@@ -619,7 +544,6 @@ class EmailQueueProcessor:
                 except Exception:
                     pass
 
-            # MAIL FROM
             code, _ = server.mail(mail_from if mail_from is not None else '')
             if code not in (250, 251):
                 raise RuntimeError(f"MAIL FROM rejected with {code}")
@@ -655,7 +579,6 @@ class EmailQueueProcessor:
                 pass
             raise
 
-    # --- Server lifecycle ---
     def start(self):
         self.running = True
         self.queue_thread = threading.Thread(target=self.process_queue, daemon=True)
@@ -668,7 +591,7 @@ class EmailQueueProcessor:
                 return SMTPRequestHandler(*args)
 
         self.server = PlainTCPServer(('0.0.0.0', SMTP_PORT), HandlerFactory(self))
-        logger.info(f"SMTP server listening on 0.0.0.0:{SMTP_PORT} (plaintext, no health-check special casing)")
+        logger.info(f"SMTP server listening on 0.0.0.0:{SMTP_PORT}")
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
 
@@ -684,7 +607,7 @@ class EmailQueueProcessor:
 # ==================== MAIN ====================
 def main():
     logger.info("=" * 60)
-    logger.info("🚀 STARTING EMAIL DAEMON (Plain SMTP + DKIM)")
+    logger.info("STARTING EMAIL DAEMON (Plain SMTP + DKIM)")
     logger.info("=" * 60)
     processor = EmailQueueProcessor()
     try:
