@@ -596,8 +596,10 @@ class EmailQueueProcessor:
         class HandlerFactory:
             def __init__(self, processor):
                 self.processor = processor
-            def __call__(self, *args):
-                return SMTPRequestHandler(*args)
+            def __call__(self, request, client_address, server):
+                # Attach the processor so handler can queue messages & log properly
+                server.processor = self.processor
+                return SMTPRequestHandler(request, client_address, server)
 
         self.server = PlainTCPServer(('0.0.0.0', SMTP_PORT), HandlerFactory(self))
         logger.info(f"SMTP server listening on 0.0.0.0:{SMTP_PORT}")
