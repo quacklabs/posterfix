@@ -136,7 +136,11 @@ class RateLimiter:
 # ==================== TLS / DKIM MANAGER ====================
 class TLSManager:
     def __init__(self):
-        self.private_key = self.load_private_key(DKIM_PRIVATE_KEY_PATH)
+        try:
+            self.private_key = self.load_private_key(DKIM_PRIVATE_KEY_PATH)
+        except Exception as e:
+            logger.warning(f"Could not load DKIM private key ({DKIM_PRIVATE_KEY_PATH}): {e}")
+            self.private_key = None
 
     def load_private_key(self, path):
         with open(path, 'rb') as f:
@@ -144,6 +148,8 @@ class TLSManager:
 
     def sign_raw_message(self, raw_bytes: bytes, mail_from: str) -> bytes:
         # derive signing domain from envelope sender
+        if not self.private_key:
+            return raw_bytes
         try:
             domain = (mail_from.split('@', 1)[1]).lower()
         except Exception:
@@ -261,7 +267,6 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         self.send_response('221 2.0.0 Bye')
         self.connected = False
 
-
     def smtp_MAIL(self, arg):
         if not arg or not arg.upper().startswith("FROM:"):
             self.send_response("501 5.5.4 Syntax: MAIL FROM:<address>")
@@ -292,17 +297,31 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         self.mailfrom = addr
         self.send_response("250 2.1.0 OK")
 
-
     def smtp_RCPT(self, arg):
-        if not self.mailfrom:
+        # Accept RCPT parameters (e.g. NOTIFY, ORCPT, etc.) by trimming after first space
+        if not self.mailfrom and self.mailfrom != "":
+            # mailfrom may be empty string for null sender; that's allowed
             self.send_response('503 5.5.1 Need MAIL before RCPT')
             return
         if not arg or not arg.upper().startswith('TO:'):
             self.send_response('501 5.5.4 Syntax: RCPT TO:<address>')
             return
         addr = arg[3:].strip()
+
+        # split off any ESMTP parameters
+        if " " in addr:
+            addr = addr.split(" ", 1)[0]
+
+        # handle null recipient <>
+        if addr in ("", "<>"):
+            self.send_response('553 5.1.7 Invalid recipient address')
+            return
+
+        # strip angle brackets and quotes
         if addr.startswith('<') and addr.endswith('>'):
             addr = addr[1:-1]
+        addr = addr.strip().strip('"')
+
         if not EmailValidator.validate_email_format(addr):
             self.send_response('553 5.1.7 Invalid recipient address')
             return
