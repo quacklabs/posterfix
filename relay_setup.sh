@@ -8,11 +8,16 @@ PROJECT_DIR="/opt/email_daemon"
 SERVICE_USER="emaildaemon"
 VENV_DIR="$PROJECT_DIR/venv"
 LOG_DIR="/var/log/email_daemon"
+SERIAL=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --master)
       MASTER="$2"
+      shift 2
+      ;;
+    --serial)
+      SERIAL="$2"
       shift 2
       ;;
     *)
@@ -26,6 +31,13 @@ if [[ -z "$MASTER" ]]; then
   echo "Error: --master parameter is required"
   exit 1
 fi
+
+
+echo "mail.$DOMAIN" > /etc/hostname
+hostnamectl set-hostname "$SERIAL.$DOMAIN"
+echo "127.0.0.1 localhost $SERIAL.$DOMAIN $SERIAL" > /etc/hosts
+echo "::1 localhost ip6-localhost ip6-loopback" >> /etc/hosts
+
 
 # Step 1: Update system and install dependencies
 echo "Updating system and installing dependencies..."
@@ -166,7 +178,7 @@ User=$SERVICE_USER
 Group=$SERVICE_USER
 WorkingDirectory=$PROJECT_DIR
 Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=$VENV_DIR/bin/python $PROJECT_DIR/main.py
+ExecStart=$VENV_DIR/bin/python $PROJECT_DIR/email_daemon.py
 Restart=always
 RestartSec=5s
 Environment=PYTHONUNBUFFERED=1
