@@ -764,28 +764,28 @@ class EmailQueueProcessor:
             return []
 
 
-        def group_by_domain(self, emails):
-            valid_emails = []
-            grouped_emails = defaultdict(list)
-            
-            for email_addr in emails:
-                if not self.validator.validate_email_format(email_addr):
-                    logger.warning(f"Invalid email format: {email_addr}")
-                    continue
-                    
-                domain = email_addr.split('@')[1]
-                
-                if (self.validator.is_banned_tld(domain) or 
-                    self.validator.is_blocklisted_domain(domain)):
-                    logger.warning(f"Email domain blocked: {domain}")
-                    continue
-                    
-                valid_emails.append(email_addr)
-                grouped_emails[domain].append(email_addr)
-                
-            return valid_emails, grouped_emails
-
+    def group_by_domain(self, emails):
+        valid_emails = []
+        grouped_emails = defaultdict(list)
         
+        for email_addr in emails:
+            if not self.validator.validate_email_format(email_addr):
+                logger.warning(f"Invalid email format: {email_addr}")
+                continue
+                
+            domain = email_addr.split('@')[1]
+            
+            if (self.validator.is_banned_tld(domain) or 
+                self.validator.is_blocklisted_domain(domain)):
+                logger.warning(f"Email domain blocked: {domain}")
+                continue
+                
+            valid_emails.append(email_addr)
+            grouped_emails[domain].append(email_addr)
+            
+        return valid_emails, grouped_emails
+
+    
     def send_mail_batch(self, mx_server, batch, subject, content, content_type, sender_name):
         successful = []
         failed = []
