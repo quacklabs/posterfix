@@ -71,6 +71,15 @@ logger.addHandler(stream_handler)
 # ==================== UTILITIES ====================
 _EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
 
+def extract_address(command: str) -> str | None:
+    """
+    Extracts the email address between <> in SMTP commands like:
+    MAIL FROM:<user@example.com>
+    RCPT TO:<dest@example.com>
+    """
+    match = re.search(r'<([^<>]+)>', command)
+    return match.group(1) if match else None
+
 class EmailValidator:
     @staticmethod
     def validate_email_format(email_address: str) -> bool:
@@ -303,8 +312,8 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             return
 
         # use parseaddr to get bare address
-        _, addr = parseaddr(token)
-        addr = addr.strip()
+        addr = extract_address(token)
+        # addr = addr.strip()
 
         if not addr or not EmailValidator.validate_email_format(addr):
             self.send_response("553 5.1.7 Invalid sender address")
