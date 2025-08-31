@@ -36,14 +36,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger('EmailDaemon')
 
-class ThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
+# SSL-enabled TCP server
+class SSLThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
-    timeout = 5
+    timeout = 10
     
-    def __init__(self, server_address, handler_class, processor):
+    def __init__(self, server_address, handler_class, processor, ssl_context=None):
         super().__init__(server_address, handler_class)
         self.processor = processor
+        self.ssl_context = ssl_context
+        
+    def get_request(self):
+        socket, addr = super().get_request()
+        socket.settimeout(10)
+        
+        if self.ssl_context:
+            try:
+                # Wrap socket with SSL immediately (HAProxy expects this)
+                socket = self.ssl_context.wrap_socket(socket, server_side=True)
+                logger.info(f"SSL handshake completed with {addr}")
+            except ssl.SSLError as e:
+                logger.warning(f"SSL handshake failed with {addr}: {e}")
+                try:
+                    # Still try to send SMTP response
+                    socket.sendall(b'220 ESMTP Email Daemon ready\r\n')
+                except:
+                    pass
+                socket.close()
+                raise
+            except Exception as e:
+                logger.error(f"Error wrapping socket with SSL: {e}")
+                socket.close()
+                raise
+        return socket, addr
 
 class SMTPRequestHandler(socketserver.BaseRequestHandler):
     def __init__(self, request, client_address, server):
@@ -87,9 +113,9 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
                     break
                 
                 buffer += data
-                logger.debug(f"Received data: {data.hex()}")
+                logger.debug(f"Received {len(data)} bytes from {self.client_ip}")
                 
-                # Process complete SMTP commands (lines ending with \r\n)
+                # Process complete SMTP commands
                 while b'\r\n' in buffer:
                     line_end = buffer.find(b'\r\n')
                     line_data = buffer[:line_end]
@@ -161,7 +187,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             return
             
         elif line_upper.startswith('EHLO ') or line_upper == 'EHLO':
-            # HAProxy EHLO health check - respond with proper SMTP format
+            # HAProxy EHLO health check
             self.send_response('250-%s' % socket.getfqdn())
             self.send_response('250-8BITMIME')
             self.send_response('250-PIPELINING')
@@ -176,7 +202,6 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             return
             
         else:
-            # Unknown health check, respond generically
             self.send_response('250 OK')
             logger.info(f"Responded to unknown health check: {line}")
 
@@ -214,7 +239,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             logger.error(f"Error sending response: {e}")
             self.connected = False
 
-    # SMTP command methods (keep your existing methods but ensure they work with health checks)
+    # SMTP command methods
     def smtp_EHLO(self, arg):
         if not arg:
             self.send_response('501 Syntax: EHLO hostname')
@@ -341,11 +366,39 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             self.rcpttos = []
 
 class HAProxySMTPServer:
-    def __init__(self, host, port, processor):
+    def __init__(self, host, port, processor, use_ssl=True):
         self.processor = processor
         self.host = host
         self.port = port
+        self.use_ssl = use_ssl
         self.server = None
+        self.ssl_context = None
+        
+        if use_ssl:
+            self.setup_ssl_context()
+        
+    def setup_ssl_context(self):
+        """Setup SSL context for secure connections"""
+        try:
+            self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            # Load your SSL certificates
+            self.ssl_context.load_cert_chain(
+                certfile='/etc/ssl/default/fullchain.pem',
+                keyfile='/etc/ssl/default/ssl.key'
+            )
+            # Use compatible cipher settings
+            self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:RSA+AESGCM:RSA+AES:!aNULL:!MD5:!DSS')
+            self.ssl_context.check_hostname = False
+            self.ssl_context.verify_mode = ssl.CERT_NONE
+            
+            logger.info("SSL context configured successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup SSL context: {e}")
+            # Fallback to basic context
+            self.ssl_context = ssl.create_default_context()
+            self.ssl_context.check_hostname = False
+            self.ssl_context.verify_mode = ssl.CERT_NONE
         
     def start(self):
         class HandlerFactory:
@@ -355,18 +408,25 @@ class HAProxySMTPServer:
             def __call__(self, *args):
                 return SMTPRequestHandler(*args)
         
-        class CustomServer(ThreadedTCPServer):
-            def __init__(self, server_address, handler_class, processor):
-                super().__init__(server_address, handler_class, processor)
+        class CustomServer(SSLThreadedTCPServer):
+            def __init__(self, server_address, handler_class, processor, ssl_context=None):
+                super().__init__(server_address, handler_class, processor, ssl_context)
                 self.processor = processor
         
         handler_factory = HandlerFactory(self.processor)
         
         try:
-            self.server = CustomServer((self.host, self.port), handler_factory, self.processor)
+            self.server = CustomServer(
+                (self.host, self.port), 
+                handler_factory, 
+                self.processor,
+                self.ssl_context if self.use_ssl else None
+            )
+            
             self.server.socket.settimeout(30)
             
-            logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port}")
+            ssl_status = "with SSL" if self.use_ssl else "without SSL"
+            logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port} {ssl_status}")
             
             # Test local connectivity
             test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -441,29 +501,24 @@ class RateLimiter:
 class EmailValidator:
     @staticmethod
     def validate_email_format(email_address):
-        """Validate email format using RFC 5322 compliant regex"""
-        pattern = r'^[a-zA-Z00-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(pattern, email_address) is not None
 
     @staticmethod
     def sanitize_email_address(email_address):
-        """Sanitize and normalize email address"""
         name, addr = email_address.split('@') if '@' in email_address else ('', email_address)
         return addr.lower() if addr else email_address
 
     @staticmethod
     def filter_spam(text):
-        """Filter spam words from email content"""
         return not any(word in text.lower() for word in SPAM_WORDS)
 
     @staticmethod
     def is_banned_tld(domain):
-        """Check if domain has banned TLD"""
         return any(domain.endswith(tld) for tld in BANNED_TLDS)
 
     @staticmethod
     def is_blocklisted_domain(domain):
-        """Check if domain is in blocklist"""
         return domain in BLOCKLIST_DOMAINS
 
 class MX_Server:
@@ -485,7 +540,6 @@ class EmailQueueProcessor:
         self.haproxy_server = None
 
     def add_to_queue(self, recipients, subject, content, content_type, sender_name):
-        """Add email to processing queue"""
         email_data = {
             'recipients': recipients,
             'subject': subject,
@@ -504,7 +558,6 @@ class EmailQueueProcessor:
         logger.info(f"Added {len(recipients)} recipients to queue")
 
     def process_queue(self):
-        """Process emails from the queue"""
         while self.running:
             try:
                 try:
@@ -531,7 +584,6 @@ class EmailQueueProcessor:
                 time.sleep(5)
 
     def ping_mx_server(self, host, port):
-        """Ping the MX server on the given port to check if it's an SMTP server"""
         hostname = socket.gethostname()
         greeting = f'EHLO {hostname}\r\n'
         try:
@@ -550,7 +602,6 @@ class EmailQueueProcessor:
             return False
 
     def get_mx_servers(self, domain):
-        """Get MX servers for domain with caching, filtered by allowed ports"""
         if domain in self._mx_cache:
             return self._mx_cache[domain]
         
@@ -572,7 +623,6 @@ class EmailQueueProcessor:
             return []
 
     def group_by_domain(self, emails):
-        """Group emails by domain and validate them"""
         valid_emails = []
         grouped_emails = defaultdict(list)
         
@@ -594,7 +644,6 @@ class EmailQueueProcessor:
         return valid_emails, grouped_emails
 
     def send_mail_batch(self, mx_server, batch, subject, content, content_type, sender_name):
-        """Send batch of emails with rate limiting and DKIM signing"""
         successful = []
         failed = []
         
@@ -651,7 +700,6 @@ class EmailQueueProcessor:
         return successful, failed
 
     def process_emails(self, emails, subject, content, content_type, sender_name):
-        """Process list of emails through appropriate MX servers"""
         valid_emails, grouped_emails = self.group_by_domain(emails)
         successful = []
         failed = []
@@ -680,7 +728,6 @@ class EmailQueueProcessor:
         return successful, failed
 
     def start(self):
-        """Start the queue processor"""
         self.running = True
         
         # Start queue processing thread
@@ -688,14 +735,13 @@ class EmailQueueProcessor:
         self.queue_thread.daemon = True
         self.queue_thread.start()
         
-        # Start HAProxy SMTP server (without SSL)
-        self.haproxy_server = HAProxySMTPServer('0.0.0.0', 3000, self)
+        # Start HAProxy SMTP server WITH SSL
+        self.haproxy_server = HAProxySMTPServer('0.0.0.0', 3000, self, use_ssl=True)
         self.haproxy_server.start()
         
-        logger.info("Email daemon started successfully")
+        logger.info("Email daemon started successfully with SSL support")
 
     def stop(self):
-        """Stop the queue processor"""
         self.running = False
         if self.haproxy_server:
             self.haproxy_server.stop()
@@ -707,7 +753,15 @@ if __name__ == "__main__":
     
     try:
         processor.start()
+        logger.info("Email daemon started. Waiting for HAProxy SSL connections...")
+        
         while True:
-            time.sleep(1)
+            time.sleep(60)
+            logger.debug("Daemon heartbeat")
+            
     except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        processor.stop()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
         processor.stop()
