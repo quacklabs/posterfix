@@ -46,7 +46,7 @@ sudo apt-get update -y
 sudo apt-get upgrade -y
 
 # Install Python and pip if not already installed
-sudo apt-get install -y python3 python3-pip python3-venv python3-full ufw
+sudo apt-get install -y python3 python3-pip python3-venv python3-full ufw git git-man rsync
 
 # Create project directory
 echo "Creating project directory..."
