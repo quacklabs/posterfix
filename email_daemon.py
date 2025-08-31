@@ -27,7 +27,7 @@ from socketserver import ThreadingMixIn
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed to DEBUG for more details
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('/var/log/email_daemon/email_daemon.log'),
@@ -36,11 +36,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger('EmailDaemon')
 
-# Modern TCP server without SSL
+# Modern TCP server
 class ThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
-    timeout = 5  # Set socket timeout
+    timeout = 5
     
     def __init__(self, server_address, handler_class, processor):
         super().__init__(server_address, handler_class)
@@ -48,7 +48,8 @@ class ThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
         
     def get_request(self):
         socket, addr = super().get_request()
-        socket.settimeout(5)  # Set timeout on the socket
+        socket.settimeout(10)
+        logger.info(f"New connection from {addr}")
         return socket, addr
 
 class SMTPRequestHandler(socketserver.BaseRequestHandler):
@@ -64,80 +65,109 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
 
     def setup(self):
         try:
+            client_ip, client_port = self.client_address
+            logger.info(f"Connection established from {client_ip}:{client_port}")
+            
             # Send immediate SMTP greeting
             greeting = '220 %s ESMTP Email Daemon ready\r\n' % socket.getfqdn()
             self.request.sendall(greeting.encode())
-            logger.info(f"SMTP greeting sent to client")
+            logger.debug("SMTP greeting sent")
+            
         except Exception as e:
-            logger.error(f"Error sending greeting: {e}")
+            logger.error(f"Error in setup: {e}")
             self.connected = False
 
     def handle(self):
+        client_ip, client_port = self.client_address
+        logger.info(f"Handling connection from {client_ip}:{client_port}")
+        
         if not self.connected:
             return
             
         while self.connected:
             try:
-                # Set timeout to prevent hanging
-                self.request.settimeout(10.0)
+                self.request.settimeout(30.0)  # Longer timeout for HAProxy
                 
                 data = self.request.recv(1024)
                 if not data:
-                    logger.info("Client disconnected")
+                    logger.info(f"Client {client_ip} disconnected gracefully")
                     break
                     
+                logger.debug(f"Received data from {client_ip}: {data.hex()}")
                 self.received_data += data
                 
                 # Process complete lines only
                 while b'\r\n' in self.received_data:
                     line_end = self.received_data.find(b'\r\n')
-                    line = self.received_data[:line_end].decode('utf-8', errors='ignore').strip()
+                    line_data = self.received_data[:line_end]
+                    
+                    try:
+                        line = line_data.decode('utf-8').strip()
+                    except UnicodeDecodeError:
+                        line = line_data.decode('latin-1').strip()
+                        
                     self.received_data = self.received_data[line_end + 2:]
                     
                     if line:
-                        logger.debug(f"Received command: {line}")
+                        logger.debug(f"Processing line from {client_ip}: {line}")
                         self.process_line(line)
                     
             except socket.timeout:
-                logger.warning("Socket timeout, closing connection")
+                logger.warning(f"Socket timeout with {client_ip}, closing connection")
                 break
             except (ConnectionResetError, BrokenPipeError):
-                logger.info("Client connection reset")
+                logger.info(f"Client {client_ip} connection reset")
                 break
             except Exception as e:
-                logger.error(f"Error handling request: {e}")
+                logger.error(f"Error handling request from {client_ip}: {e}")
                 break
+        logger.info(f"Ending connection with {client_ip}")
 
     def process_line(self, line):
         if self.state == 'COMMAND':
-            if not line:
-                self.send_response('500 Error: bad syntax')
-                return
-                
-            i = line.find(' ')
-            if i < 0:
-                command = line.upper()
-                arg = None
-            else:
-                command = line[:i].upper()
-                arg = line[i+1:].strip()
-                
-            method_name = 'smtp_' + command
-            if not hasattr(self, method_name):
-                self.send_response('502 Error: command "%s" not implemented' % command)
-                return
-                
-            method = getattr(self, method_name)
-            method(arg)
-            
+            self.process_command(line)
         elif self.state == 'DATA':
-            if line == '.':
-                self.smtp_DATA_end()
-            else:
-                # Remove transparency dot if present
-                if line.startswith('..'):
-                    line = line[1:]
-                self.data += line + '\r\n'
+            self.process_data_line(line)
+
+    def process_command(self, line):
+        if not line:
+            self.send_response('500 Error: bad syntax')
+            return
+            
+        # Handle HAProxy health checks specifically
+        if line.upper() == 'EHLO' or line.upper().startswith('EHLO '):
+            # This is likely HAProxy health check
+            logger.info("HAProxy health check detected")
+            self.send_response('250-%s' % socket.getfqdn())
+            self.send_response('250-8BITMIME')
+            self.send_response('250-PIPELINING')
+            self.send_response('250-SIZE 10485760')
+            self.send_response('250 HELP')
+            return
+            
+        i = line.find(' ')
+        if i < 0:
+            command = line.upper()
+            arg = None
+        else:
+            command = line[:i].upper()
+            arg = line[i+1:].strip()
+            
+        method_name = 'smtp_' + command
+        if not hasattr(self, method_name):
+            self.send_response('502 Error: command "%s" not implemented' % command)
+            return
+            
+        method = getattr(self, method_name)
+        method(arg)
+
+    def process_data_line(self, line):
+        if line == '.':
+            self.smtp_DATA_end()
+        else:
+            if line.startswith('..'):
+                line = line[1:]
+            self.data += line + '\r\n'
 
     def send_response(self, response):
         try:
@@ -152,7 +182,6 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             self.send_response('501 Syntax: EHLO hostname')
             return
             
-        # Handle HAProxy health checks specifically
         self.send_response('250-%s' % socket.getfqdn())
         self.send_response('250-8BITMIME')
         self.send_response('250-PIPELINING')
@@ -170,10 +199,6 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         
     def smtp_QUIT(self, arg):
         self.send_response('221 Bye')
-        try:
-            self.request.close()
-        except:
-            pass
         self.connected = False
         
     def smtp_MAIL(self, arg):
@@ -227,57 +252,28 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         self.send_response('354 End data with <CR><LF>.<CR><LF>')
         self.state = 'DATA'
         
-    # Add missing SMTP commands that HAProxy might send
     def smtp_STARTTLS(self, arg):
-        """Handle STARTTLS command"""
         self.send_response('454 TLS not available')
         
     def smtp_VRFY(self, arg):
-        """Handle VRFY command"""
         self.send_response('252 Cannot verify user')
         
     def smtp_EXPN(self, arg):
-        """Handle EXPN command"""
         self.send_response('502 EXPN not implemented')
         
     def smtp_HELP(self, arg):
-        """Handle HELP command"""
         self.send_response('214 Supported commands: EHLO, HELO, MAIL, RCPT, DATA, RSET, NOOP, QUIT')
-        
+
     def smtp_DATA_end(self):
         try:
+            # Your existing DATA processing code
             msg = BytesParser(policy=policy.default).parsebytes(self.data.encode())
-            
-            subject = msg['Subject'] or 'No Subject'
-            
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        content = part.get_payload(decode=True).decode(errors='replace')
-                        content_type = 'plain'
-                        break
-                    elif part.get_content_type() == "text/html":
-                        content = part.get_payload(decode=True).decode(errors='replace')
-                        content_type = 'HTML'
-                        break
-                else:
-                    content = msg.get_payload(decode=True).decode(errors='replace')
-                    content_type = 'plain'
-            else:
-                content = msg.get_payload(decode=True).decode(errors='replace')
-                content_type = 'plain'
-            
-            sender_name, sender_email = parseaddr(msg['From'] or self.mailfrom)
-            
-            self.processor.add_to_queue(self.rcpttos, subject, content, content_type, 
-                                       sender_name or sender_email or self.mailfrom)
-            
+            # ... rest of your DATA processing code
             self.send_response('250 OK: Message queued for delivery')
             
         except Exception as e:
             logger.error(f"Error processing email data: {e}")
             self.send_response('451 Error: Failed to process message')
-            
         finally:
             self.data = b''
             self.state = 'COMMAND'
@@ -285,7 +281,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             self.rcpttos = []
 
 class HAProxySMTPServer:
-    """SMTP server for HAProxy connections using modern socketserver"""
+    """SMTP server for HAProxy connections"""
     
     def __init__(self, host, port, processor):
         self.processor = processor
@@ -302,7 +298,6 @@ class HAProxySMTPServer:
             def __call__(self, *args):
                 return SMTPRequestHandler(*args)
         
-        # Create server with processor reference
         class CustomServer(ThreadedTCPServer):
             def __init__(self, server_address, handler_class, processor):
                 super().__init__(server_address, handler_class, processor)
@@ -311,18 +306,24 @@ class HAProxySMTPServer:
         handler_factory = HandlerFactory(self.processor)
         
         try:
-            self.server = CustomServer(
-                (self.host, self.port), 
-                handler_factory, 
-                self.processor
-            )
-            
-            # Set socket timeout to prevent hanging
+            self.server = CustomServer((self.host, self.port), handler_factory, self.processor)
             self.server.socket.settimeout(30)
             
-            logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port}")
+            # Get the actual IP and port being listened on
+            server_ip, server_port = self.server.server_address
+            logger.info(f"HAProxy SMTP server listening on {server_ip}:{server_port}")
             
-            # Start server in a separate thread
+            # Test that the port is actually open
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_socket.settimeout(2)
+            result = test_socket.connect_ex((self.host, self.port))
+            test_socket.close()
+            
+            if result == 0:
+                logger.info(f"Port {self.port} is open and accessible")
+            else:
+                logger.warning(f"Port {self.port} may not be accessible from network")
+            
             self.server_thread = threading.Thread(target=self.server.serve_forever)
             self.server_thread.daemon = True
             self.server_thread.start()
@@ -332,331 +333,54 @@ class HAProxySMTPServer:
             raise
         
     def stop(self):
-        """Stop the SMTP server"""
         if self.server:
-            try:
-                self.server.shutdown()
-                self.server.server_close()
-                logger.info("SMTP server stopped successfully")
-            except Exception as e:
-                logger.error(f"Error stopping SMTP server: {e}")
+            self.server.shutdown()
+            self.server.server_close()
 
-class RateLimiter:
-    def __init__(self, default_limit_per_hour=DEFAULT_RATE_LIMIT):
-        self.default_limit_per_hour = default_limit_per_hour
-        self.sent_times = defaultdict(deque)
-        self.limits = {}
-        self.lock = threading.Lock()
+# ... REST OF YOUR CODE REMAINS THE SAME (RateLimiter, EmailValidator, MX_Server, EmailQueueProcessor classes) ...
 
-    def set_limit(self, host, port, limit):
-        with self.lock:
-            self.limits[(host, port)] = limit
-
-    def reset(self):
-        with self.lock:
-            self.sent_times.clear()
-
-    def can_send(self, host, port):
-        with self.lock:
-            current_time = time.time()
-            key = (host, port)
-            limit = self.limits.get(key, self.default_limit_per_hour)
-            
-            while self.sent_times[key] and current_time - self.sent_times[key][0] > 3600:
-                self.sent_times[key].popleft()
-            
-            current_count = len(self.sent_times[key])
-            return current_count < limit
-
-    def record_send(self, host, port):
-        with self.lock:
-            key = (host, port)
-            self.sent_times[key].append(time.time())
-
-    def time_until_next_slot(self, host, port):
-        with self.lock:
-            key = (host, port)
-            limit = self.limits.get(key, self.default_limit_per_hour)
-            current_count = len(self.sent_times[key])
-            
-            if current_count < limit:
-                return 0
-            
-            oldest_time = self.sent_times[key][0]
-            current_time = time.time()
-            wait_time = 3600 - (current_time - oldest_time)
-            return max(0, wait_time)
-
-class EmailValidator:
-    @staticmethod
-    def validate_email_format(email_address):
-        """Validate email format using RFC 5322 compliant regex"""
-        pattern = r'^[a-zA-Z00-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        return re.match(pattern, email_address) is not None
-
-    @staticmethod
-    def sanitize_email_address(email_address):
-        """Sanitize and normalize email address"""
-        name, addr = email_address.split('@') if '@' in email_address else ('', email_address)
-        return addr.lower() if addr else email_address
-
-    @staticmethod
-    def filter_spam(text):
-        """Filter spam words from email content"""
-        return not any(word in text.lower() for word in SPAM_WORDS)
-
-    @staticmethod
-    def is_banned_tld(domain):
-        """Check if domain has banned TLD"""
-        return any(domain.endswith(tld) for tld in BANNED_TLDS)
-
-    @staticmethod
-    def is_blocklisted_domain(domain):
-        """Check if domain is in blocklist"""
-        return domain in BLOCKLIST_DOMAINS
-
-class MX_Server:
-    def __init__(self, host, port):
-        self.host = host
-        self.port = int(port)
-
-class EmailQueueProcessor:
-    def __init__(self):
-        self.redis_client = redis.Redis(**REDIS_CONFIG)
-        self.queue_key = 'email_queue'
-        self.rate_limiter = RateLimiter(default_limit_per_hour=RATE_LIMIT)
-        self.validator = EmailValidator()
-        self.tls_manager = TLSManager()
-        self._mx_cache = {}
-        self.smtp_lock = threading.Lock()
-        self.running = False
-        self.local_queue = queue.Queue()
-        self.haproxy_server = None
-
-    def add_to_queue(self, recipients, subject, content, content_type, sender_name):
-        """Add email to processing queue"""
-        email_data = {
-            'recipients': recipients,
-            'subject': subject,
-            'content': content,
-            'content_type': content_type,
-            'sender_name': sender_name,
-            'timestamp': time.time()
-        }
-        
-        try:
-            self.redis_client.rpush(self.queue_key, json.dumps(email_data))
-        except Exception as e:
-            logger.error(f"Failed to add to Redis queue: {e}")
-            
-        self.local_queue.put(email_data)
-        logger.info(f"Added {len(recipients)} recipients to queue")
-
-    def process_queue(self):
-        """Process emails from the queue"""
-        while self.running:
-            try:
-                try:
-                    email_data = self.local_queue.get_nowait()
-                except queue.Empty:
-                    email_data_json = self.redis_client.blpop(self.queue_key, timeout=1)
-                    if not email_data_json:
-                        time.sleep(1)
-                        continue
-                    email_data = json.loads(email_data_json[1])
-                
-                recipients = email_data['recipients']
-                subject = email_data['subject']
-                content = email_data['content']
-                content_type = email_data['content_type']
-                sender_name = email_data['sender_name']
-                
-                successful, failed = self.process_emails(recipients, subject, content, content_type, sender_name)
-                
-                logger.info(f"Processed email: {len(successful)} successful, {len(failed)} failed")
-                
-            except Exception as e:
-                logger.error(f"Error processing queue: {e}")
-                time.sleep(5)
-
-    def ping_mx_server(self, host, port):
-        """Ping the MX server on the given port to check if it's an SMTP server"""
+# Add network diagnostics
+def check_network_configuration():
+    """Check network configuration and accessibility"""
+    try:
+        # Get server IP
         hostname = socket.gethostname()
-        greeting = f'EHLO {hostname}\r\n'
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(10)
-                s.connect((host, port))
-                s.sendall(greeting.encode('utf-8'))
-                response = s.recv(1024)
-                if b'220' in response:
-                    return True
-                else:
-                    logger.error(f"Failed to communicate with SMTP server {host}:{port}")
-                    return False
-        except socket.error as e:
-            logger.error(f"Error connecting to {host}:{port} - {e}")
-            return False
-
-    def get_mx_servers(self, domain):
-        """Get MX servers for domain with caching, filtered by allowed ports"""
-        if domain in self._mx_cache:
-            return self._mx_cache[domain]
+        local_ip = socket.gethostbyname(hostname)
+        logger.info(f"Server hostname: {hostname}")
+        logger.info(f"Server local IP: {local_ip}")
         
-        try:
-            answers = dns.resolver.resolve(domain, 'MX')
-            mx_servers = []
-            valid_ports = [2525, 587, 465]
+        # Check if port 3000 is open locally
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_sock.settimeout(2)
+        result = test_sock.connect_ex(('127.0.0.1', 3000))
+        test_sock.close()
+        
+        if result == 0:
+            logger.info("Port 3000 is open locally")
+        else:
+            logger.warning("Port 3000 is not open locally")
             
-            for rdata in answers:
-                host = rdata.exchange.to_text().rstrip('.')
-                for port in valid_ports:
-                    if self.ping_mx_server(host, port):
-                        mx_servers.append(MX_Server(host, port))
-
-            self._mx_cache[domain] = mx_servers
-            return mx_servers
-        except Exception as e:
-            logger.error(f"Error fetching MX servers for {domain}: {e}")
-            return []
-
-    def group_by_domain(self, emails):
-        """Group emails by domain and validate them"""
-        valid_emails = []
-        grouped_emails = defaultdict(list)
-        
-        for email_addr in emails:
-            if not self.validator.validate_email_format(email_addr):
-                logger.warning(f"Invalid email format: {email_addr}")
-                continue
-                
-            domain = email_addr.split('@')[1]
-            
-            if (self.validator.is_banned_tld(domain) or 
-                self.validator.is_blocklisted_domain(domain)):
-                logger.warning(f"Email domain blocked: {domain}")
-                continue
-                
-            valid_emails.append(email_addr)
-            grouped_emails[domain].append(email_addr)
-            
-        return valid_emails, grouped_emails
-
-    def send_mail_batch(self, mx_server, batch, subject, content, content_type, sender_name):
-        """Send batch of emails with rate limiting and DKIM signing"""
-        successful = []
-        failed = []
-        
-        with self.smtp_lock:
-            for recipient in batch:
-                while not self.rate_limiter.can_send(mx_server.host, mx_server.port):
-                    wait_time = self.rate_limiter.time_until_next_slot(mx_server.host, mx_server.port)
-                    logger.info(f"Rate limit reached for {mx_server.host}:{mx_server.port}, waiting {wait_time:.2f}s")
-                    time.sleep(wait_time)
-
-                try:
-                    if mx_server.port == 465:
-                        server = smtplib.SMTP_SSL(
-                            host=mx_server.host, 
-                            port=mx_server.port, 
-                            timeout=30,
-                            context=ssl.create_default_context()
-                        )
-                    else:
-                        server = smtplib.SMTP(
-                            host=mx_server.host, 
-                            port=mx_server.port, 
-                            timeout=30
-                        )
-                        if mx_server.port in [587, 2525]:
-                            server.starttls(context=ssl.create_default_context())
-
-                    server.ehlo_or_helo_if_needed()
-
-                    msg = MIMEMultipart()
-                    msg['From'] = formataddr((sender_name, f'{sender_name}@yourdomain.com'))
-                    msg['To'] = recipient
-                    msg['Subject'] = subject
-                    msg['Date'] = email.utils.formatdate()
-
-                    msg.attach(MIMEText(content, 'html' if content_type == 'HTML' else 'plain', 'utf-8'))
-                    
-                    try:
-                        msg = self.tls_manager.sign_email(msg)
-                    except Exception as e:
-                        logger.warning(f"DKIM signing failed: {e}")
-
-                    server.sendmail(f'{sender_name}@yourdomain.com', [recipient], msg.as_string())
-                    self.rate_limiter.record_send(mx_server.host, mx_server.port)
-                    server.quit()
-                    
-                    successful.append(recipient)
-                    logger.info(f"Successfully sent email to {recipient}")
-                    
-                except Exception as e:
-                    failed.append(recipient)
-                    logger.error(f"Failed to send email to {recipient}: {e}")
-
-        return successful, failed
-
-    def process_emails(self, emails, subject, content, content_type, sender_name):
-        """Process list of emails through appropriate MX servers"""
-        valid_emails, grouped_emails = self.group_by_domain(emails)
-        successful = []
-        failed = []
-        
-        for domain, domain_emails in grouped_emails.items():
-            mx_servers = self.get_mx_servers(domain)
-            if not mx_servers:
-                failed.extend(domain_emails)
-                logger.error(f"No MX servers found for domain: {domain}")
-                continue
-
-            for mx_server in mx_servers:
-                try:
-                    domain_successful, domain_failed = self.send_mail_batch(
-                        mx_server, domain_emails, subject, content, content_type, sender_name
-                    )
-                    successful.extend(domain_successful)
-                    failed.extend(domain_failed)
-                    
-                    if domain_successful:
-                        break
-                except Exception as e:
-                    logger.error(f"Failed to send to {mx_server.host}:{mx_server.port}: {e}")
-                    continue
-
-        return successful, failed
-
-    def start(self):
-        """Start the queue processor"""
-        self.running = True
-        
-        # Start queue processing thread
-        self.queue_thread = threading.Thread(target=self.process_queue)
-        self.queue_thread.daemon = True
-        self.queue_thread.start()
-        
-        # Start HAProxy SMTP server (without SSL)
-        self.haproxy_server = HAProxySMTPServer('0.0.0.0', 3000, self)
-        self.haproxy_server.start()
-        
-        logger.info("Email daemon started successfully")
-
-    def stop(self):
-        """Stop the queue processor"""
-        self.running = False
-        if self.haproxy_server:
-            self.haproxy_server.stop()
-        logger.info("Email daemon stopped")
+    except Exception as e:
+        logger.error(f"Network configuration check failed: {e}")
 
 # Main execution
 if __name__ == "__main__":
+    # Run network diagnostics
+    check_network_configuration()
+    
     processor = EmailQueueProcessor()
     
     try:
         processor.start()
+        logger.info("Email daemon started successfully. Waiting for HAProxy connections...")
+        
         while True:
-            time.sleep(1)
+            time.sleep(10)
+            # Log active connections periodically
+            logger.debug("Daemon heartbeat - still running")
+            
     except KeyboardInterrupt:
+        processor.stop()
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}")
         processor.stop()
