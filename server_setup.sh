@@ -297,7 +297,7 @@ defaults
     timeout server 1m
 frontend https_in
     bind *:443 ssl crt /etc/haproxy/cert.pem
-    
+
 frontend outgoing_smtp
     bind *:2525
     default_backend relay_servers
@@ -310,7 +310,7 @@ EOF
 line_number=1
 # Loop through the relay_list file and add server lines dynamically
 while IFS= read -r ip; do
-    echo "    server mx${line_number} ${ip}:3000 ssl ca-file /etc/ssl/default/ca.pem crt /etc/ssl/default/fullchain.pem verify required check send-proxy" >> /etc/haproxy/haproxy.cfg
+    echo "    server mx${line_number} ${ip}:3000 ssl ca-file /etc/ssl/default/ca.pem crt /etc/haproxy/cert.pem verify required check send-proxy" >> /etc/haproxy/haproxy.cfg
     ((line_number++))  # Increment the line number counter
 done < "$RELAY_LIST"
 
