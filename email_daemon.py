@@ -343,64 +343,11 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
                 break
 
     def process_smtp_command(self, line):
-        if self.is_haproxy_health_check(line):
-            self.handle_haproxy_health_check(line)
-            return
-            
         if self.state == 'COMMAND':
             self.process_smtp_command_state(line)
         elif self.state == 'DATA':
             self.process_data_line(line)
-
-    def is_haproxy_health_check(self, line):
-        line_upper = line.upper()
-        patterns = [
-            line_upper == 'EHLO',
-            line_upper.startswith('EHLO '),
-            line_upper == 'HELO', 
-            line_upper.startswith('HELO '),
-            line_upper == 'QUIT',
-            line_upper == 'NOOP',
-            any(domain in line_upper for domain in HAPROXY_HEALTH_CHECK_DOMAINS),
-            len(line_upper) < 20
-        ]
-        return any(patterns)
-
-    def handle_haproxy_health_check(self, line):
-        line_upper = line.upper()
-        logger.info(f"🏥 [{self.session_id}] HAProxy health check: {line}")
-        
-        if line_upper == 'QUIT':
-            self.send_response('221 2.0.0 Bye')
-            self.connected = False
-            logger.info(f"✅ [{self.session_id}] Health check completed with QUIT")
-            return
-            
-        elif line_upper == 'NOOP':
-            self.send_response('250 2.0.0 OK')
-            logger.info(f"✅ [{self.session_id}] Responded to NOOP")
-            return
-            
-        elif line_upper.startswith('EHLO ') or line_upper == 'EHLO':
-            self.send_response('250-%s' % socket.gethostname())
-            self.send_response('250-8BITMIME')
-            self.send_response('250-PIPELINING')
-            self.send_response('250-SIZE 10485760')
-            self.send_response('250-AUTH PLAIN LOGIN')
-            self.send_response('250-ENHANCEDSTATUSCODES')
-            self.send_response('250 HELP')
-            logger.info(f"✅ [{self.session_id}] Responded to EHLO health check")
-            return
-            
-        elif line_upper.startswith('HELO ') or line_upper == 'HELO':
-            self.send_response('250 %s' % socket.getfqdn())
-            logger.info(f"✅ [{self.session_id}] Responded to HELO health check")
-            return
-            
-        else:
-            self.send_response('250 2.0.0 OK')
-            logger.info(f"✅ [{self.session_id}] Responded to unknown health check")
-
+   
     def process_smtp_command_state(self, line):
         i = line.find(' ')
         if i < 0:
