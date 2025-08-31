@@ -36,10 +36,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger('EmailDaemon')
 
-# Modern SSL-enabled TCP server
+
+#SMTP SSL
 class SSLThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    timeout = 5  # Set socket timeout
     
     def __init__(self, server_address, handler_class, processor, ssl_context=None):
         super().__init__(server_address, handler_class)
@@ -48,12 +50,20 @@ class SSLThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
         
     def get_request(self):
         socket, addr = super().get_request()
+        socket.settimeout(5)  # Set timeout on the socket
+        
         if self.ssl_context:
             try:
+                # HAProxy expects immediate SSL - don't wait for STARTTLS
                 socket = self.ssl_context.wrap_socket(socket, server_side=True)
-                logger.debug("SSL handshake completed successfully")
+                logger.debug(f"SSL handshake completed with {addr}")
             except ssl.SSLError as e:
-                logger.error(f"SSL handshake failed: {e}")
+                logger.warning(f"SSL handshake failed with {addr}: {e}")
+                # Try to send SMTP response even if SSL fails
+                try:
+                    socket.sendall(b'220 ESMTP Email Daemon ready\r\n')
+                except:
+                    pass
                 socket.close()
                 raise
             except Exception as e:
@@ -254,7 +264,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
 class HAProxySMTPServer:
     """SMTP server for HAProxy connections using modern socketserver"""
     
-    def __init__(self, host, port, processor, use_ssl=False):
+    def __init__(self, host, port, processor, use_ssl=True):  # Changed to True by default
         self.processor = processor
         self.host = host
         self.port = port
@@ -262,25 +272,32 @@ class HAProxySMTPServer:
         self.server = None
         self.ssl_context = None
         
-        if use_ssl:
-            self.setup_ssl_context()
+        self.setup_ssl_context()  # Always setup SSL context
         
     def setup_ssl_context(self):
         """Setup SSL context for secure connections"""
         try:
             self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            # Load your SSL certificates
             self.ssl_context.load_cert_chain(
                 certfile='/etc/ssl/default/fullchain.pem',
                 keyfile='/etc/ssl/default/ssl.key'
             )
-            self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:RSA+AESGCM:RSA+AES:!aNULL:!MD5:!DSS')
+            # Use more compatible cipher settings
+            self.ssl_context.set_ciphers('HIGH:!aNULL:!MD5:!RC4:!3DES')
             self.ssl_context.check_hostname = False
             self.ssl_context.verify_mode = ssl.CERT_NONE
-            logger.info("SSL context configured successfully")
+            
+            # Set shorter timeouts for better HAProxy compatibility
+            self.ssl_context.options |= ssl.OP_NO_TICKET
+            logger.info("SSL context configured successfully for HAProxy")
+            
         except Exception as e:
             logger.error(f"Failed to setup SSL context: {e}")
-            self.ssl_context = None
-            self.use_ssl = False
+            # Don't disable SSL entirely, just continue without specific context
+            self.ssl_context = ssl.create_default_context()
+            self.ssl_context.check_hostname = False
+            self.ssl_context.verify_mode = ssl.CERT_NONE
         
     def start(self):
         """Start the SMTP server"""
