@@ -9,6 +9,7 @@ SERVICE_USER="emaildaemon"
 VENV_DIR="$PROJECT_DIR/venv"
 LOG_DIR="/var/log/email_daemon"
 SERIAL=""
+DOMAIN="rafmail.com"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
