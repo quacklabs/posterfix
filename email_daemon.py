@@ -253,7 +253,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         try:
             logger.info(f"🔄 NEW CONNECTION [{self.session_id}] from {self.client_ip}:{self.client_port}")
             
-            greeting = '220 %s ESMTP Email Daemon ready\r\n' % socket.getfqdn()
+            greeting = '220 %s ESMTP Email Daemon ready\r\n' % socket.gethostname()
             self.request.sendall(greeting.encode())
             logger.info(f"📤 [{self.session_id}] Sent: 220 ESMTP ready")
             
@@ -344,7 +344,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             return
             
         elif line_upper.startswith('EHLO ') or line_upper == 'EHLO':
-            self.send_response('250-%s' % socket.getfqdn())
+            self.send_response('250-%s' % socket.gethostname())
             self.send_response('250-8BITMIME')
             self.send_response('250-PIPELINING')
             self.send_response('250-SIZE 10485760')
@@ -355,7 +355,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             return
             
         elif line_upper.startswith('HELO ') or line_upper == 'HELO':
-            self.send_response('250 %s' % socket.getfqdn())
+            self.send_response('250 %s' % socket.gethostname())
             logger.info(f"✅ [{self.session_id}] Responded to HELO health check")
             return
             
@@ -403,7 +403,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
             self.send_response('501 5.5.4 Syntax: EHLO hostname')
             return
             
-        self.send_response('250-%s' % socket.getfqdn())
+        self.send_response('250-%s' % socket.gethostname())
         self.send_response('250-8BITMIME')
         self.send_response('250-PIPELINING')
         self.send_response('250-SIZE 10485760')
@@ -414,7 +414,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         if not arg:
             self.send_response('501 5.5.4 Syntax: HELO hostname')
             return
-        self.send_response('250 %s' % socket.getfqdn())
+        self.send_response('250 %s' % socket.gethostname())
         
     def smtp_NOOP(self, arg):
         logger.info(f"📨 [{self.session_id}] Processing NOOP")
