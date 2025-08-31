@@ -814,7 +814,7 @@ class EmailQueueProcessor:
         self.queue_thread.start()
         
         # Start HAProxy SMTP server
-        self.haproxy_server = HAProxySMTPServer('0.0.0.0', SMTP_PORT, self, use_ssl=True)
+        self.haproxy_server = HAProxySMTPServer('0.0.0.0', SMTP_PORT, self, use_ssl=False)
         self.haproxy_server.start()
         
         logger.info("Email daemon started successfully")
