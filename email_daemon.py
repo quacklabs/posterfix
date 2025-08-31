@@ -30,16 +30,37 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('email_daemon.log'),
+        logging.FileHandler('/var/log/email_daemon/email_daemon.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('EmailDaemon')
 
-# Modern replacement for asyncore functionality
-class ThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
+# Modern SSL-enabled TCP server
+class SSLThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    
+    def __init__(self, server_address, handler_class, processor, ssl_context=None):
+        super().__init__(server_address, handler_class)
+        self.processor = processor
+        self.ssl_context = ssl_context
+        
+    def get_request(self):
+        socket, addr = super().get_request()
+        if self.ssl_context:
+            try:
+                socket = self.ssl_context.wrap_socket(socket, server_side=True)
+                logger.debug("SSL handshake completed successfully")
+            except ssl.SSLError as e:
+                logger.error(f"SSL handshake failed: {e}")
+                socket.close()
+                raise
+            except Exception as e:
+                logger.error(f"Error wrapping socket with SSL: {e}")
+                socket.close()
+                raise
+        return socket, addr
 
 class SMTPRequestHandler(socketserver.BaseRequestHandler):
     def __init__(self, request, client_address, server):
@@ -52,7 +73,10 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         super().__init__(request, client_address, server)
 
     def setup(self):
-        self.request.sendall(b'220 %s ESMTP Email Daemon ready\r\n' % socket.getfqdn().encode())
+        try:
+            self.request.sendall(b'220 %s ESMTP Email Daemon ready\r\n' % socket.getfqdn().encode())
+        except Exception as e:
+            logger.error(f"Error sending greeting: {e}")
 
     def handle(self):
         while True:
@@ -65,10 +89,11 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
                 if b'\r\n' in self.received_data:
                     lines = self.received_data.split(b'\r\n')
                     for line in lines[:-1]:
-                        self.process_line(line.decode('utf-8').strip())
+                        if line:  # Skip empty lines
+                            self.process_line(line.decode('utf-8').strip())
                     self.received_data = lines[-1]
                     
-            except (ConnectionResetError, BrokenPipeError):
+            except (ConnectionResetError, BrokenPipeError, socket.timeout):
                 break
             except Exception as e:
                 logger.error(f"Error handling request: {e}")
@@ -104,7 +129,10 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
                 self.data += line + '\r\n'
 
     def send_response(self, response):
-        self.request.sendall(response.encode() + b'\r\n')
+        try:
+            self.request.sendall(response.encode() + b'\r\n')
+        except Exception as e:
+            logger.error(f"Error sending response: {e}")
 
     def smtp_EHLO(self, arg):
         if not arg:
@@ -127,7 +155,10 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         
     def smtp_QUIT(self, arg):
         self.send_response('221 Bye')
-        self.request.close()
+        try:
+            self.request.close()
+        except:
+            pass
         
     def smtp_MAIL(self, arg):
         if not arg or not arg.upper().startswith('FROM:'):
@@ -223,11 +254,33 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
 class HAProxySMTPServer:
     """SMTP server for HAProxy connections using modern socketserver"""
     
-    def __init__(self, host, port, processor):
+    def __init__(self, host, port, processor, use_ssl=False):
         self.processor = processor
         self.host = host
         self.port = port
+        self.use_ssl = use_ssl
         self.server = None
+        self.ssl_context = None
+        
+        if use_ssl:
+            self.setup_ssl_context()
+        
+    def setup_ssl_context(self):
+        """Setup SSL context for secure connections"""
+        try:
+            self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self.ssl_context.load_cert_chain(
+                certfile='/etc/ssl/default/fullchain.pem',
+                keyfile='/etc/ssl/default/ssl.key'
+            )
+            self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:RSA+AESGCM:RSA+AES:!aNULL:!MD5:!DSS')
+            self.ssl_context.check_hostname = False
+            self.ssl_context.verify_mode = ssl.CERT_NONE
+            logger.info("SSL context configured successfully")
+        except Exception as e:
+            logger.error(f"Failed to setup SSL context: {e}")
+            self.ssl_context = None
+            self.use_ssl = False
         
     def start(self):
         """Start the SMTP server"""
@@ -239,26 +292,44 @@ class HAProxySMTPServer:
                 return SMTPRequestHandler(*args)
         
         # Create server with processor reference
-        class CustomServer(ThreadedTCPServer):
-            def __init__(self, server_address, handler_class, processor):
-                super().__init__(server_address, handler_class)
+        class CustomServer(SSLThreadedTCPServer):
+            def __init__(self, server_address, handler_class, processor, ssl_context=None):
+                super().__init__(server_address, handler_class, processor, ssl_context)
                 self.processor = processor
         
         handler_factory = HandlerFactory(self.processor)
-        self.server = CustomServer((self.host, self.port), handler_factory, self.processor)
         
-        logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port}")
-        
-        # Start server in a separate thread
-        self.server_thread = threading.Thread(target=self.server.serve_forever)
-        self.server_thread.daemon = True
-        self.server_thread.start()
+        try:
+            self.server = CustomServer(
+                (self.host, self.port), 
+                handler_factory, 
+                self.processor,
+                self.ssl_context if self.use_ssl else None
+            )
+            
+            # Set socket timeout to prevent hanging
+            self.server.socket.settimeout(30)
+            
+            logger.info(f"HAProxy SMTP server listening on {self.host}:{self.port} {'(SSL)' if self.use_ssl else ''}")
+            
+            # Start server in a separate thread
+            self.server_thread = threading.Thread(target=self.server.serve_forever)
+            self.server_thread.daemon = True
+            self.server_thread.start()
+            
+        except Exception as e:
+            logger.error(f"Failed to start SMTP server: {e}")
+            raise
         
     def stop(self):
         """Stop the SMTP server"""
         if self.server:
-            self.server.shutdown()
-            self.server.server_close()
+            try:
+                self.server.shutdown()
+                self.server.server_close()
+                logger.info("SMTP server stopped successfully")
+            except Exception as e:
+                logger.error(f"Error stopping SMTP server: {e}")
 
 class RateLimiter:
     def __init__(self, default_limit_per_hour=DEFAULT_RATE_LIMIT):

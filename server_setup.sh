@@ -359,7 +359,6 @@ cat /dev/null > /etc/cockpit/disallowed-users
 # Setup keys for relay servers
 useradd -m -s /bin/bash "dkim-user" 2>/dev/null || true
 echo "dkim-user:Exc@libur" | chpasswd
-usermod -s /usr/sbin/nologin "dkim-user"
 
 mkdir -p $SHARED_DIR
 cat $CERT_DIR/fullchain.pem > $SHARED_DIR/fullchain.pem
