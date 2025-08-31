@@ -276,7 +276,7 @@ class MX_Server:
 class SMTPRequestHandler(socketserver.BaseRequestHandler):
     def __init__(self, request, client_address, server):
         self.processor = server.processor
-        self.data = b''
+        self.data = b""
         self.mailfrom = None
         self.rcpttos = []
         self.received_data = b''
@@ -371,7 +371,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
         else:
             if line.startswith('..'):
                 line = line[1:]
-            self.data += line + '\r\n'
+            self.data += (line + '\r\n').encode('utf-8')
 
     def send_response(self, response):
         try:
@@ -485,7 +485,7 @@ class SMTPRequestHandler(socketserver.BaseRequestHandler):
     def smtp_DATA_end(self):
         try:
             logger.info(f"📨 [{self.session_id}] Processing DATA end")
-            msg = BytesParser(policy=policy.default).parsebytes(self.data.encode())
+            msg = BytesParser(policy=policy.default).parsebytes(self.data)
             
             subject = msg['Subject'] or 'No Subject'
             
